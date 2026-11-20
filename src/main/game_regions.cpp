@@ -8,6 +8,10 @@
 #include "ovl_patches.hpp"
 #include "ultramodern/ultramodern.hpp"
 
+#if defined(__ANDROID__)
+#include "sk1_android.h"
+#endif
+
 #ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
 #include <Windows.h>
@@ -157,6 +161,9 @@ bool start_game(const std::u8string& game_id) {
         }
         registered_game = game_id;
     }
+#if defined(__ANDROID__)
+    sk1android::on_game_started();
+#endif
     recomp::start_game(game_id, {});
     return true;
 }

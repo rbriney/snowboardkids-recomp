@@ -2,9 +2,11 @@
 // (kardeiro/snowboardkids2-recomp-Android, GPL-3.0).
 #include "sk1_android.h"
 
+#include <SDL.h>
 #include <SDL_system.h>
 #include <android/log.h>
 
+#include <atomic>
 #include <condition_variable>
 #include <cstdlib>
 #include <map>
@@ -17,6 +19,7 @@ namespace {
     std::filesystem::path g_asset_root;
     std::filesystem::path g_external_root;
     jclass g_bridge_class = nullptr;
+    std::atomic<SDL_Joystick*> g_touch_joystick{nullptr};
 
     std::mutex g_dialog_mutex;
     std::condition_variable g_dialog_cv;
@@ -149,5 +152,50 @@ namespace sk1android {
             }
         }
         g_dialog_cv.notify_all();
+    }
+
+    void on_game_started() {
+        if (g_touch_joystick.load() == nullptr) {
+            // 6 axes and 15 buttons give SDL's standard virtual gamepad mapping: axes LEFTX, LEFTY, RIGHTX, RIGHTY,
+            // TRIGGERLEFT, TRIGGERRIGHT and buttons in SDL_GameControllerButton order up to DPAD_RIGHT.
+            const int device_index = SDL_JoystickAttachVirtual(SDL_JOYSTICK_TYPE_GAMECONTROLLER,
+                                                               SDL_CONTROLLER_AXIS_MAX, SDL_CONTROLLER_BUTTON_DPAD_RIGHT + 1, 0);
+            if (device_index < 0) {
+                __android_log_print(ANDROID_LOG_ERROR, "SK1", "touch controller attach failed: %s", SDL_GetError());
+            } else {
+                SDL_Joystick* joystick = SDL_JoystickOpen(device_index);
+                if (joystick != nullptr) {
+                    // Triggers map to 0 at the bottom of the axis range, so they must rest at -32768.
+                    SDL_JoystickSetVirtualAxis(joystick, SDL_CONTROLLER_AXIS_TRIGGERLEFT, -32768);
+                    SDL_JoystickSetVirtualAxis(joystick, SDL_CONTROLLER_AXIS_TRIGGERRIGHT, -32768);
+                    g_touch_joystick.store(joystick);
+                    __android_log_print(ANDROID_LOG_INFO, "SK1", "touch controller attached (device %d)", device_index);
+                }
+            }
+        }
+
+        JNIEnv* env = get_env();
+        if (env != nullptr && g_bridge_class != nullptr) {
+            jmethodID method = env->GetStaticMethodID(g_bridge_class, "onGameStarted", "()V");
+            if (method != nullptr) {
+                env->CallStaticVoidMethod(g_bridge_class, method);
+            } else {
+                env->ExceptionClear();
+            }
+        }
+    }
+
+    void set_touch_button(int sdl_button, bool pressed) {
+        SDL_Joystick* joystick = g_touch_joystick.load();
+        if (joystick != nullptr) {
+            SDL_JoystickSetVirtualButton(joystick, sdl_button, pressed ? SDL_PRESSED : SDL_RELEASED);
+        }
+    }
+
+    void set_touch_axis(int sdl_axis, int value) {
+        SDL_Joystick* joystick = g_touch_joystick.load();
+        if (joystick != nullptr) {
+            SDL_JoystickSetVirtualAxis(joystick, sdl_axis, static_cast<Sint16>(SDL_clamp(value, -32768, 32767)));
+        }
     }
 }

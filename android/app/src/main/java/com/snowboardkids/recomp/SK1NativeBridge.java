@@ -13,6 +13,18 @@ public final class SK1NativeBridge {
     public static native void nativeOnFilePicked(int callbackId, boolean success, String path);
     public static native void nativeOnFilePickedMultiple(int callbackId, boolean success, String[] paths);
 
+    // On-screen touch controls -> SDL virtual game controller (SDL_GameControllerButton / SDL_GameControllerAxis).
+    public static native void nativeTouchButton(int sdlButton, boolean pressed);
+    public static native void nativeTouchAxis(int sdlAxis, int value);
+
+    // Called from native code on the game thread when a game starts.
+    public static void onGameStarted() {
+        final SK1Activity activity = SK1Activity.getInstance();
+        if (activity != null) {
+            activity.runOnUiThread(activity::showTouchControls);
+        }
+    }
+
     // Called from native code on the SDL thread. Launches the SAF picker on the UI thread.
     public static void openFileDialog(int callbackId) {
         final SK1Activity activity = SK1Activity.getInstance();

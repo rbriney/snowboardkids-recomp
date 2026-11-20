@@ -6,8 +6,13 @@ Based on the Snowboard Kids 2 Android port by kardeiro/deivid22srk
 ([kardeiro/snowboardkids2-recomp-Android](https://github.com/kardeiro/snowboardkids2-recomp-Android), GPL-3.0),
 which uses the same RT64 / N64ModernRuntime / RecompFrontend libraries.
 
-Status: early bring-up. A Bluetooth/USB controller is required (no touch controls yet).
-Custom Vulkan drivers (Turnip via libadrenotools) are not included; the system driver is used.
+Status: playable on a Pixel 9 (Mali-G715). Custom Vulkan drivers (Turnip via libadrenotools) are not included;
+the system driver is used.
+
+Controls: on-screen touch controls (analog stick, A, B, Z, Start) appear when a game starts. They drive an SDL
+virtual game controller, so the game sees them like a physical gamepad. A toggle at the top centre hides or
+shows them; they start hidden when a physical controller is connected. Bluetooth/USB controllers work too, and
+on Android the D-pad also drives the analog stick so D-pad-only pads can steer.
 
 ## How it fits together
 

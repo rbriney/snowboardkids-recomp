@@ -45,4 +45,12 @@ namespace sk1android {
 
     // Attaches to the JVM if needed and returns the current thread's JNIEnv.
     JNIEnv* get_env();
+
+    // Called on the game thread when a game starts: attaches the virtual controller driven by the on-screen
+    // touch controls and asks Java to show them.
+    void on_game_started();
+
+    // On-screen touch controls feed an SDL virtual game controller (standard gamepad layout).
+    void set_touch_button(int sdl_button, bool pressed);
+    void set_touch_axis(int sdl_axis, int value);
 }

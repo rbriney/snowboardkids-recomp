@@ -58,3 +58,13 @@ Java_com_snowboardkids_recomp_SK1NativeBridge_nativeOnFilePickedMultiple(JNIEnv*
                                                                          jboolean success, jobjectArray paths) {
     sk1android::deliver_file_dialog_multiple(static_cast<int>(id), success == JNI_TRUE, from_jarray(env, paths));
 }
+
+extern "C" JNIEXPORT void JNICALL
+Java_com_snowboardkids_recomp_SK1NativeBridge_nativeTouchButton(JNIEnv*, jclass, jint button, jboolean pressed) {
+    sk1android::set_touch_button(static_cast<int>(button), pressed == JNI_TRUE);
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_com_snowboardkids_recomp_SK1NativeBridge_nativeTouchAxis(JNIEnv*, jclass, jint axis, jint value) {
+    sk1android::set_touch_axis(static_cast<int>(axis), static_cast<int>(value));
+}
