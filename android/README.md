@@ -66,6 +66,33 @@ N64Recomp/RSPRecomp and the generated code from `scripts/generate-code.py` (see 
 
 `SK1_NATIVE_BUILD_DIR` overrides where Gradle looks for the native build (default `../build-android`).
 
+## Release builds
+
+Release APKs are signed with a release key that stays off the repository. Both scripts let the Java tools
+prompt for the password, so it never appears in a file, environment variable or command line.
+
+1. Create the key once (back up the `.jks` file and its password: every update must be signed with the same
+   key or Android refuses to install it over the previous version):
+
+   ```
+   powershell -ExecutionPolicy Bypass -File android\create-release-key.ps1 -Keystore D:\path\to\release.jks
+   ```
+
+2. Build the native library (step 2 above, with `GAME_VERSION` set), then the unsigned, stripped release APK:
+
+   ```
+   cd android
+   gradlew assembleRelease
+   ```
+
+3. Align, sign and verify it, producing `app/build/outputs/apk/release/SnowboardKidsRecompiled-Android-ARM64.apk`:
+
+   ```
+   powershell -ExecutionPolicy Bypass -File android\sign-release.ps1 -Keystore D:\path\to\release.jks
+   ```
+
+For each release, increase `versionCode` (and `versionName`) in `app/build.gradle`.
+
 ## On the device
 
 On first launch, pick your legally obtained US Snowboard Kids ROM (`.z64`) when the launcher asks. Saves, config

@@ -2,7 +2,11 @@
 
 [Snowboard Kids: Recompiled](https://github.com/cdlewis/snowboardkids-recomp) is a project that uses [N64: Recompiled](https://github.com/Mr-Wiseguy/N64Recomp) to **statically recompile** Snowboard Kids into a native port with many new features, enhancements, and extensive mod support. This project uses [RT64](https://github.com/rt64/rt64) as the rendering engine to provide some of these enhancements.
 
-### [Download the latest release here](https://github.com/cdlewis/snowboardkids-recomp/releases/latest)
+### [Download the latest release here](https://github.com/cdlewis/snowboardkids-recomp/releases/latest) (Windows, macOS, Linux)
+
+### [Download the Android APK here](https://github.com/rbriney/snowboardkids-recomp/releases/latest) (Android, from this fork)
+
+This fork adds an Android port. See [Android](#android) for requirements and how to install it.
 
 Join the [Snowboard Kids Community Discord](https://discord.gg/PJzG4F8SpF) to discuss this and other Snowboard Kids games/projects.
 
@@ -13,6 +17,7 @@ Join the [Snowboard Kids Community Discord](https://discord.gg/PJzG4F8SpF) to di
 ## Table of Contents
 
 - [System Requirements](#system-requirements)
+- [Android](#android)
 - [Features](#features)
 - [Planned Features](#planned-features)
 - [FAQ](#faq)
@@ -36,6 +41,36 @@ On x86-64 PCs, a CPU supporting the SSE4.1 instruction set is also required (Int
 Windows users should have the [Visual C++ Redistributable](https://learn.microsoft.com/en-us/cpp/windows/latest-supported-vc-redist?view=msvc-170) installed.
 
 If you have issues with crashes on startup, make sure your graphics drivers are fully up to date.
+
+## Android
+
+The Android port is an APK you install directly ("sideload"); it is not on the Google Play Store. Like the desktop
+releases, **it does not contain the game: you need to provide your own copy of the North American (US) N64 release
+of Snowboard Kids.** The Android build does not support the Japanese version yet.
+
+#### Requirements
+
+- Android 8.0 or newer on a 64-bit ARM (arm64-v8a) phone or tablet
+- A GPU with Vulkan 1.2 support
+- Tested on a Google Pixel 9 (Tensor G4, Mali-G715). Other devices should work but are untested; please report issues.
+
+#### Installing
+
+1. On your phone or tablet, download `SnowboardKidsRecompiled-Android-ARM64.apk` from the
+   [latest release](https://github.com/rbriney/snowboardkids-recomp/releases/latest).
+2. Open the downloaded file. Android will ask you to allow your browser or file manager to install unknown apps;
+   allow it, then tap **Install**. Play Protect may warn that the app is from an unknown developer; this is normal
+   for apps installed outside the Play Store.
+3. Copy your US Snowboard Kids ROM (`.z64`, `.n64` or `.v64`) onto the device, for example into **Downloads**.
+4. Launch **Snowboard Kids Recomp**, tap **Select ROM** and choose your ROM file. Then tap **Start game**.
+
+To update, install the newer APK over the old one; your saves and settings are kept.
+
+#### Controls
+
+On-screen touch controls (analog stick, A, B, Z, the C-buttons for board grabs, and Start) appear when the game
+starts. The button at the top centre hides or shows them; they start hidden if a controller is connected.
+Bluetooth and USB controllers work too, and the D-pad also steers, so D-pad-only controllers can be used.
 
 ## Features
 
@@ -105,6 +140,7 @@ Unlike N64 ports in the past, this project is not based on the source code provi
 - Windows: `%LOCALAPPDATA%\SnowboardKidsRecompiled\saves`
 - Linux: `~/.config/SnowboardKidsRecompiled/saves`
 - macOS: `~/Library/Application Support/SnowboardKidsRecompiled/saves`
+- Android: `Android/data/com.snowboardkids.recomp/files/saves` on the device's internal storage
 
 #### How do I choose a different ROM?
 
@@ -117,10 +153,13 @@ Yes, if you place a file named `portable.txt` in the same folder as the executab
 ## Known Issues
 
 - Overlays such as MSI Afterburner and other software such as Wallpaper Engine can cause performance issues with this project that prevent the game from rendering correctly. Disabling such software is recommended.
+- Android: only the US version of the game is supported, and the port has only been tested on a Pixel 9 (Mali GPU). Mods with native code are not supported on Android.
 
 ## Building
 
 Building is not required to play this project, as prebuilt binaries (which do not contain game assets) can be found in the [Releases](https://github.com/cdlewis/snowboardkids-recomp/releases/latest) section. Instructions on how to build this project can be found in the [BUILDING.md](BUILDING.md) file.
+
+The Android APK is likewise available prebuilt in [this fork's releases](https://github.com/rbriney/snowboardkids-recomp/releases/latest). To build it yourself, see [android/README.md](android/README.md).
 
 ## Libraries Used and Projects Referenced
 
