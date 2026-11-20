@@ -382,15 +382,23 @@ void on_launcher_init(recompui::LauncherMenu* menu) {
     rock->set_height(100.0f, Unit::Percent);
     rock->set_pointer_events(PointerEvents::None);
 
-    auto* version = context.create_element<Label>(version_group, "v" + recomp::get_project_version().to_string(),
-                                                  LabelStyle::Small);
+    const std::string version_text = "v" + recomp::get_project_version().to_string();
+    // About 9 characters fit on the dark part of the rock at 27 dp. Release versions ("v1.2.0") are shorter; longer
+    // prerelease strings shrink to fit instead of spilling white text onto the white background.
+    constexpr float version_font_size = 27.0f;
+    constexpr size_t version_fit_chars = 9;
+    const float version_scale = version_text.size() > version_fit_chars
+        ? float(version_fit_chars) / float(version_text.size())
+        : 1.0f;
+    auto* version = context.create_element<Label>(version_group, version_text, LabelStyle::Small);
     version->set_position(Position::Relative);
     version->set_top(-2.0f);
     version->set_left(-2.0f);
     version->set_font_family("Fredoka");
-    version->set_font_size(27.0f);
+    version->set_font_size(version_font_size * version_scale);
     version->set_font_weight(400);
-    version->set_line_height(27.0f);
+    version->set_line_height(version_font_size * version_scale);
+    version->set_white_space(WhiteSpace::Nowrap);
     version->set_color(Color{ 255, 255, 255, 230 });
 
     Element* menu_container = context.create_element<Element>(menu);

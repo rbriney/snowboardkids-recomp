@@ -43,7 +43,8 @@ N64Recomp/RSPRecomp and the generated code from `scripts/generate-code.py` (see 
    git -C lib/RecompFrontend apply ../../android/patches/recompfrontend.patch
    ```
 
-2. Configure and build the native library from a Visual Studio developer shell:
+2. Configure and build the native library from a Visual Studio developer shell. Without release tags, set the
+   version first (shown on the launcher), e.g. `set GAME_VERSION=0.1.0`:
 
    ```
    cmake -S . -B build-android -G Ninja ^
