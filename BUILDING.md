@@ -3,7 +3,8 @@
 This guide will help you build the project on your local machine. You will need to provide:
 
 - A copy of the North American N64 release of Snowboard Kids as `snowboardkids.z64` in the repository root.
-- A copy of the Japanese N64 release of Snowboard Kids as `snowboardkids.jp.z64` in the repository root.
+- Optionally, a copy of the Japanese N64 release of Snowboard Kids as `snowboardkids.jp.z64` in the repository root.
+  Without it, only the US version is built: configure CMake with `-DSK1_ENABLE_JP=OFF` (see step 6).
 
 Neither file is distributed with this repository.
 
@@ -102,7 +103,8 @@ generate. Updating them for a new decompilation build is a commit in that submod
 python3 scripts/generate-code.py
 ```
 
-This produces `RecompiledFuncs/`, `RecompiledFuncsJP/`, and `rsp/aspMain.cpp`. The patch recompilers (`patches.toml`
+This produces `RecompiledFuncs/`, `RecompiledFuncsJP/`, and `rsp/aspMain.cpp`. If `snowboardkids.jp.z64` is absent,
+`RecompiledFuncsJP/` is skipped and the build must use `-DSK1_ENABLE_JP=OFF`. The patch recompilers (`patches.toml`
 and `patches.jp.toml`) are run automatically as part of the CMake build.
 
 ## 6. Build the Project
@@ -119,6 +121,14 @@ cmake --build build-cmake --target SnowboardKidsRecompiled -j$(nproc) --config R
 
 `scripts/clean-build.sh` wraps a full from-scratch build including the patch payload.
 
+To build the US version only (no Japanese ROM), add `-DSK1_ENABLE_JP=OFF` to the configure command.
+
+The patch payload is MIPS code, so `PATCHES_C_COMPILER` must be a clang with the MIPS backend. On Windows, the LLVM
+installer and Visual Studio's bundled clang both omit it; use the portable `LLVM-19.1.3-Windows-X64.tar.xz` release
+as CI does, passing `-DPATCHES_C_COMPILER=<llvm>/bin/clang.exe -DPATCHES_LD=<llvm>/bin/ld.lld.exe`. A Windows
+command-line configure that matches CI also needs `-DCMAKE_C_COMPILER=clang-cl -DCMAKE_CXX_COMPILER=clang-cl` and
+`-DCMAKE_CXX_FLAGS="-Xclang -fexceptions -Xclang -fcxx-exceptions"`.
+
 The version string is taken from the `GAME_VERSION` environment variable, or derived from the newest reachable `vX.Y.Z`
 git tag if it is unset. On a fresh clone with no tags, set it explicitly:
 
@@ -132,5 +142,7 @@ GAME_VERSION=0.1.0 cmake --build build-cmake --target SnowboardKidsRecompiled -j
 
 ## 7. Success
 
-You should now have a `SnowboardKidsRecompiled` executable in the build directory (a `.app` bundle on macOS). You will
-need to run the executable out of the root folder of this project or copy the `assets` folder next to it.
+You should now have a `SnowboardKidsRecompiled` executable in the build directory (a `.app` bundle on macOS). On Windows
+and Linux the build stages the runtime assets (including the theme's `recomp.rcss`) into `assets/` next to the
+executable, so run it with the build directory as the working directory. The repository's own `assets` folder is not
+sufficient on its own: without `recomp.rcss` the launcher fails at startup.

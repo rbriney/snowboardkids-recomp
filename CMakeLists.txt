@@ -173,8 +173,11 @@ endif()
 
 find_package(Python3 REQUIRED COMPONENTS Interpreter)
 include(cmake/RecompiledRegion.cmake)
+option(SK1_ENABLE_JP "Build the Japanese region (requires snowboardkids.jp.z64 during code generation)" ON)
 add_recompiled_region(us)
-add_recompiled_region(jp)
+if(SK1_ENABLE_JP)
+    add_recompiled_region(jp)
+endif()
 
 # Launcher and config-menu theming shared with snowboardkids2-recomp. Added
 # before the game target so its source, include and asset variables are
@@ -189,8 +192,7 @@ endif()
 add_executable(SnowboardKidsRecompiled)
 if(WIN32)
     target_link_libraries(SnowboardKidsRecompiled PRIVATE sk1_crash_reports)
-    sk1_stage_crashpad(SnowboardKidsRecompiled)
-    enable_testing()
+    sk1_stage_crashpad(SnowboardKidsRecompiled)    enable_testing()
     add_subdirectory(tests/windows-crash-reports EXCLUDE_FROM_ALL)
 endif()
 
@@ -202,8 +204,6 @@ set (SOURCES
     ${CMAKE_SOURCE_DIR}/src/main/support.cpp
     ${CMAKE_SOURCE_DIR}/src/main/register_overlays.cpp
     ${CMAKE_SOURCE_DIR}/src/main/register_patches.cpp
-    ${CMAKE_SOURCE_DIR}/src/main/register_overlays_jp.cpp
-    ${CMAKE_SOURCE_DIR}/src/main/register_patches_jp.cpp
 
     ${CMAKE_SOURCE_DIR}/src/game/config.cpp
     ${CMAKE_SOURCE_DIR}/src/game/quicksaving.cpp
@@ -413,11 +413,17 @@ target_include_directories(recompinput BEFORE PRIVATE
     ${CMAKE_SOURCE_DIR}/lib/N64ModernRuntime/thirdparty
 )
 
-add_dependencies(SnowboardKidsRecompiled JpSymbols)
+if(SK1_ENABLE_JP)
+    target_sources(SnowboardKidsRecompiled PRIVATE
+        ${CMAKE_SOURCE_DIR}/src/main/register_overlays_jp.cpp
+        ${CMAKE_SOURCE_DIR}/src/main/register_patches_jp.cpp
+    )
+    target_compile_definitions(SnowboardKidsRecompiled PRIVATE SK1_ENABLE_JP=1)
+    add_dependencies(SnowboardKidsRecompiled JpSymbols)
+    target_link_libraries(SnowboardKidsRecompiled PRIVATE PatchesLibJP RecompiledFuncsJP)
+endif()
 
 target_link_libraries(SnowboardKidsRecompiled PRIVATE
-    PatchesLibJP
-    RecompiledFuncsJP
     PatchesLib
     RecompiledFuncs
     recompui

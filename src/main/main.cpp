@@ -469,8 +469,10 @@ RspUcodeFunc* get_rsp_microcode(const OSTask* task) {
 extern "C" void recomp_entrypoint(uint8_t* rdram, recomp_context* ctx);
 extern "C" void recomp_run_ui_callbacks(uint8_t* rdram, recomp_context* ctx);
 gpr get_entrypoint_address();
+#ifdef SK1_ENABLE_JP
 extern "C" void jp_recomp_entrypoint(uint8_t* rdram, recomp_context* ctx);
 gpr jp_get_entrypoint_address();
+#endif
 
 // array of supported GameEntry objects
 std::vector<recomp::GameEntry> supported_games = {
@@ -487,6 +489,7 @@ std::vector<recomp::GameEntry> supported_games = {
         .entrypoint_address = get_entrypoint_address(),
         .entrypoint = recomp_entrypoint,
     },
+#ifdef SK1_ENABLE_JP
     {
         .rom_hash = 0x0de031bdfd177689ULL,
         .internal_name = "\xBD\xC9\xCE\xDE\xB7\xAF\xBD\xDE",
@@ -499,6 +502,7 @@ std::vector<recomp::GameEntry> supported_games = {
         .entrypoint_address = jp_get_entrypoint_address(),
         .entrypoint = jp_recomp_entrypoint,
     },
+#endif
 };
 
 // TODO: move somewhere else
@@ -875,6 +879,7 @@ int main(int argc, char** argv) {
         "snowboardkids_freecam",
         { reinterpret_cast<const uint8_t*>(snowboardkids_freecam), snowboardkids_freecam_size });
 
+#ifdef SK1_ENABLE_JP
     recomp::mods::register_embedded_mod(
         "snowboardkids_mod_template_jp",
         { reinterpret_cast<const uint8_t*>(snowboardkids_mod_template_jp), snowboardkids_mod_template_jp_size });
@@ -890,6 +895,7 @@ int main(int argc, char** argv) {
     recomp::mods::register_embedded_mod(
         "snowboardkids_freecam_jp",
         { reinterpret_cast<const uint8_t*>(snowboardkids_freecam_jp), snowboardkids_freecam_jp_size });
+#endif
 
     REGISTER_FUNC(recomp_get_target_aspect_ratio);
     REGISTER_FUNC(recomp_get_target_hud_aspect_ratio);

@@ -141,8 +141,12 @@ bool start_game(const std::u8string& game_id) {
         return relaunch_game(game_id);
     if (!registered_game) {
         if (game_id == u8"snowboardkids.n64.jp") {
+#ifdef SK1_ENABLE_JP
             register_jp_overlays();
             register_jp_patches();
+#else
+            return false;
+#endif
         } else {
             zelda64::register_overlays();
             zelda64::register_patches();
