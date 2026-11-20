@@ -15,20 +15,21 @@ import java.util.List;
 /**
  * On-screen N64 controller drawn over the game. Touches drive an SDL virtual game controller (see
  * sk1android::set_touch_button / set_touch_axis), so the game sees them like a physical gamepad with the
- * default bindings: A=south, B=west, Z=left trigger, stick=left stick, C-left=north, C-right=east,
- * C-up=right stick click, C-down=right shoulder. Snowboard Kids does not use L or R, so they are left out.
+ * game's default bindings: A=south, B=west, Z=left trigger, stick=left stick. The game binds the C-buttons
+ * only to the right stick (src/game/config.cpp), so the C-buttons push the right stick fully in their
+ * direction. Snowboard Kids does not use L or R, so they are left out.
  *
  * Only touches that land on a control are consumed; the parent layout splits multi-touch, so any other
  * touch still reaches the game surface underneath.
  */
 public class SK1TouchControls extends View {
     // SDL_GameControllerButton values.
-    private static final int BTN_A = 0, BTN_B = 1, BTN_X = 2, BTN_Y = 3, BTN_START = 6;
-    private static final int BTN_RIGHTSTICK = 8, BTN_RIGHTSHOULDER = 10;
+    private static final int BTN_A = 0, BTN_X = 2, BTN_START = 6;
     // SDL_GameControllerAxis values.
-    private static final int AXIS_LEFTX = 0, AXIS_LEFTY = 1, AXIS_TRIGGERLEFT = 4;
+    private static final int AXIS_LEFTX = 0, AXIS_LEFTY = 1, AXIS_RIGHTX = 2, AXIS_RIGHTY = 3, AXIS_TRIGGERLEFT = 4;
 
-    private enum Kind { BUTTON, TRIGGER, STICK, TOGGLE }
+    // AXIS pushes one axis fully in one direction while held (used for the C-buttons).
+    private enum Kind { BUTTON, TRIGGER, AXIS, STICK, TOGGLE }
 
     private static final class Control {
         final Kind kind;
@@ -36,6 +37,7 @@ public class SK1TouchControls extends View {
         final int target;        // SDL button or axis
         final float cx, cy, r;   // centre as fractions of width/height, radius as a fraction of height
         final boolean pill;      // drawn as a rounded rectangle (shoulder buttons)
+        int axisValue;           // AXIS kind: value sent while held
         boolean pressed;
         float px, py;            // pixel centre / radius, updated on layout
         float pr;
@@ -80,10 +82,10 @@ public class SK1TouchControls extends View {
         controls.add(new Control(Kind.TRIGGER, "Z", AXIS_TRIGGERLEFT, 0.80f, 0.56f, 0.08f, false));
         // C-buttons (board grabs in the air): compact diamond in the upper right, above A.
         float cX = 0.895f, cY = 0.38f, cOffY = 0.11f, cOffX = 0.055f, cR = 0.05f;
-        controls.add(new Control(Kind.BUTTON, "C▲", BTN_RIGHTSTICK, cX, cY - cOffY, cR, false));
-        controls.add(new Control(Kind.BUTTON, "C▼", BTN_RIGHTSHOULDER, cX, cY + cOffY, cR, false));
-        controls.add(new Control(Kind.BUTTON, "C◀", BTN_Y, cX - cOffX, cY, cR, false));
-        controls.add(new Control(Kind.BUTTON, "C▶", BTN_B, cX + cOffX, cY, cR, false));
+        controls.add(axisControl("C▲", AXIS_RIGHTY, -32768, cX, cY - cOffY, cR));
+        controls.add(axisControl("C▼", AXIS_RIGHTY, 32767, cX, cY + cOffY, cR));
+        controls.add(axisControl("C◀", AXIS_RIGHTX, -32768, cX - cOffX, cY, cR));
+        controls.add(axisControl("C▶", AXIS_RIGHTX, 32767, cX + cOffX, cY, cR));
         // Centre bottom: Start.
         controls.add(new Control(Kind.BUTTON, "START", BTN_START, 0.50f, 0.92f, 0.055f, true));
         // Top centre: hide/show toggle (always visible).
@@ -97,6 +99,12 @@ public class SK1TouchControls extends View {
         text.setShadowLayer(4f, 0f, 0f, 0xC0000000);
         setLayerType(View.LAYER_TYPE_SOFTWARE, null); // text shadows need software rendering on some devices
         setHapticFeedbackEnabled(true);
+    }
+
+    private static Control axisControl(String label, int axis, int value, float cx, float cy, float r) {
+        Control c = new Control(Kind.AXIS, label, axis, cx, cy, r, false);
+        c.axisValue = value;
+        return c;
     }
 
     @Override
@@ -246,6 +254,9 @@ public class SK1TouchControls extends View {
             case TRIGGER:
                 SK1NativeBridge.nativeTouchAxis(c.target, 32767);
                 break;
+            case AXIS:
+                SK1NativeBridge.nativeTouchAxis(c.target, c.axisValue);
+                break;
             case STICK:
                 updateStick(c, x, y);
                 break;
@@ -266,6 +277,9 @@ public class SK1TouchControls extends View {
                 break;
             case TRIGGER:
                 SK1NativeBridge.nativeTouchAxis(c.target, -32768);
+                break;
+            case AXIS:
+                SK1NativeBridge.nativeTouchAxis(c.target, 0);
                 break;
             case STICK:
                 c.stickX = 0f;
