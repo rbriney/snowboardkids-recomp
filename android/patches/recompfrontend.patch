@@ -46,6 +46,29 @@ index bf50055..bfa5ddc 100644
  
  namespace recompinput {
      // Shared with the UI state lock. Hold across multi-call input/profile transactions and borrowed references.
+diff --git a/recompinput/src/input_mapping.cpp b/recompinput/src/input_mapping.cpp
+index bfcfef4..147520c 100644
+--- a/recompinput/src/input_mapping.cpp
++++ b/recompinput/src/input_mapping.cpp
+@@ -49,10 +49,18 @@ namespace recompinput {
+         { GameInput::DPAD_RIGHT,     { InputField::controller_digital(SDL_CONTROLLER_BUTTON_DPAD_RIGHT) } },
+         { GameInput::DPAD_UP,        { InputField::controller_digital(SDL_CONTROLLER_BUTTON_DPAD_UP) } },
+         { GameInput::DPAD_DOWN,      { InputField::controller_digital(SDL_CONTROLLER_BUTTON_DPAD_DOWN) } },
++#if defined(__ANDROID__)
++        // Many Android controllers (and phone clip-on pads) have only a D-pad, so it also drives the analog stick.
++        { GameInput::X_AXIS_NEG,     { InputField::controller_analog( SDL_CONTROLLER_AXIS_LEFTX, false), InputField::controller_digital(SDL_CONTROLLER_BUTTON_DPAD_LEFT) } },
++        { GameInput::X_AXIS_POS,     { InputField::controller_analog( SDL_CONTROLLER_AXIS_LEFTX, true),  InputField::controller_digital(SDL_CONTROLLER_BUTTON_DPAD_RIGHT) } },
++        { GameInput::Y_AXIS_POS,     { InputField::controller_analog( SDL_CONTROLLER_AXIS_LEFTY, false), InputField::controller_digital(SDL_CONTROLLER_BUTTON_DPAD_UP) } },
++        { GameInput::Y_AXIS_NEG,     { InputField::controller_analog( SDL_CONTROLLER_AXIS_LEFTY, true),  InputField::controller_digital(SDL_CONTROLLER_BUTTON_DPAD_DOWN) } },
++#else
+         { GameInput::X_AXIS_NEG,     { InputField::controller_analog( SDL_CONTROLLER_AXIS_LEFTX, false) } },
+         { GameInput::X_AXIS_POS,     { InputField::controller_analog( SDL_CONTROLLER_AXIS_LEFTX, true) } },
+         { GameInput::Y_AXIS_POS,     { InputField::controller_analog( SDL_CONTROLLER_AXIS_LEFTY, false) } },
+         { GameInput::Y_AXIS_NEG,     { InputField::controller_analog( SDL_CONTROLLER_AXIS_LEFTY, true) } },
++#endif
+ 
+         { GameInput::TOGGLE_MENU,    { InputField::controller_digital(SDL_CONTROLLER_BUTTON_BACK) } },
+         { GameInput::ACCEPT_MENU,    { InputField::controller_digital(SDL_CONTROLLER_BUTTON_SOUTH) } },
 diff --git a/recompui/CMakeLists.txt b/recompui/CMakeLists.txt
 index b9c5458..267e216 100644
 --- a/recompui/CMakeLists.txt
