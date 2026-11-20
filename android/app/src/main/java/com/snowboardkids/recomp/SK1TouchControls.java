@@ -15,15 +15,16 @@ import java.util.List;
 /**
  * On-screen N64 controller drawn over the game. Touches drive an SDL virtual game controller (see
  * sk1android::set_touch_button / set_touch_axis), so the game sees them like a physical gamepad with the
- * default bindings: A=south, B=west, Z=left trigger, stick=left stick. Snowboard Kids does not use L, R or
- * the C-buttons, so they are left out.
+ * default bindings: A=south, B=west, Z=left trigger, stick=left stick, C-left=north, C-right=east,
+ * C-up=right stick click, C-down=right shoulder. Snowboard Kids does not use L or R, so they are left out.
  *
  * Only touches that land on a control are consumed; the parent layout splits multi-touch, so any other
  * touch still reaches the game surface underneath.
  */
 public class SK1TouchControls extends View {
     // SDL_GameControllerButton values.
-    private static final int BTN_A = 0, BTN_X = 2, BTN_START = 6;
+    private static final int BTN_A = 0, BTN_B = 1, BTN_X = 2, BTN_Y = 3, BTN_START = 6;
+    private static final int BTN_RIGHTSTICK = 8, BTN_RIGHTSHOULDER = 10;
     // SDL_GameControllerAxis values.
     private static final int AXIS_LEFTX = 0, AXIS_LEFTY = 1, AXIS_TRIGGERLEFT = 4;
 
@@ -65,25 +66,36 @@ public class SK1TouchControls extends View {
     private final Control toggle;
     private final Paint fill = new Paint(Paint.ANTI_ALIAS_FLAG);
     private final Paint stroke = new Paint(Paint.ANTI_ALIAS_FLAG);
+    private final Paint outline = new Paint(Paint.ANTI_ALIAS_FLAG);
     private final Paint text = new Paint(Paint.ANTI_ALIAS_FLAG);
     private final RectF rect = new RectF();
     private boolean controlsHidden = false;
 
     public SK1TouchControls(Context context) {
         super(context);
-        // Snowboard Kids only needs the stick, A, B, Z and Start.
+        // Snowboard Kids uses the stick, A, B, Z, the C-buttons and Start.
         controls.add(new Control(Kind.STICK, "", AXIS_LEFTX, 0.17f, 0.68f, 0.20f, false));
         controls.add(new Control(Kind.BUTTON, "A", BTN_A, 0.91f, 0.74f, 0.10f, false));
         controls.add(new Control(Kind.BUTTON, "B", BTN_X, 0.785f, 0.86f, 0.085f, false));
         controls.add(new Control(Kind.TRIGGER, "Z", AXIS_TRIGGERLEFT, 0.80f, 0.56f, 0.08f, false));
+        // C-buttons (board grabs in the air): compact diamond in the upper right, above A.
+        float cX = 0.895f, cY = 0.38f, cOffY = 0.11f, cOffX = 0.055f, cR = 0.05f;
+        controls.add(new Control(Kind.BUTTON, "C▲", BTN_RIGHTSTICK, cX, cY - cOffY, cR, false));
+        controls.add(new Control(Kind.BUTTON, "C▼", BTN_RIGHTSHOULDER, cX, cY + cOffY, cR, false));
+        controls.add(new Control(Kind.BUTTON, "C◀", BTN_Y, cX - cOffX, cY, cR, false));
+        controls.add(new Control(Kind.BUTTON, "C▶", BTN_B, cX + cOffX, cY, cR, false));
         // Centre bottom: Start.
         controls.add(new Control(Kind.BUTTON, "START", BTN_START, 0.50f, 0.92f, 0.055f, true));
         // Top centre: hide/show toggle (always visible).
         toggle = new Control(Kind.TOGGLE, "", -1, 0.50f, 0.06f, 0.045f, false);
 
         stroke.setStyle(Paint.Style.STROKE);
+        outline.setStyle(Paint.Style.STROKE);
+        outline.setColor(0x70000000);
         text.setTextAlign(Paint.Align.CENTER);
         text.setFakeBoldText(true);
+        text.setShadowLayer(4f, 0f, 0f, 0xC0000000);
+        setLayerType(View.LAYER_TYPE_SOFTWARE, null); // text shadows need software rendering on some devices
         setHapticFeedbackEnabled(true);
     }
 
@@ -95,6 +107,7 @@ public class SK1TouchControls extends View {
         }
         layout(toggle, w, h);
         stroke.setStrokeWidth(Math.max(2f, h * 0.004f));
+        outline.setStrokeWidth(Math.max(5f, h * 0.011f));
     }
 
     private static void layout(Control c, int w, int h) {
@@ -114,11 +127,11 @@ public class SK1TouchControls extends View {
     }
 
     private void drawControl(Canvas canvas, Control c) {
-        int fillAlpha = c.pressed ? 0x70 : 0x30;
-        fill.setColor((fillAlpha << 24) | 0xFFFFFF);
+        fill.setColor(c.pressed ? 0x70FFFFFF : 0x40000000);
         stroke.setColor(0x90FFFFFF);
         if (c.kind == Kind.STICK) {
             canvas.drawCircle(c.px, c.py, c.pr, fill);
+            canvas.drawCircle(c.px, c.py, c.pr, outline);
             canvas.drawCircle(c.px, c.py, c.pr, stroke);
             float knobX = c.px + c.stickX * c.pr * 0.6f;
             float knobY = c.py + c.stickY * c.pr * 0.6f;
@@ -129,20 +142,23 @@ public class SK1TouchControls extends View {
         if (c.pill) {
             rect.set(c.px - c.pr * 1.6f, c.py - c.pr * 0.8f, c.px + c.pr * 1.6f, c.py + c.pr * 0.8f);
             canvas.drawRoundRect(rect, c.pr * 0.8f, c.pr * 0.8f, fill);
+            canvas.drawRoundRect(rect, c.pr * 0.8f, c.pr * 0.8f, outline);
             canvas.drawRoundRect(rect, c.pr * 0.8f, c.pr * 0.8f, stroke);
         } else {
             canvas.drawCircle(c.px, c.py, c.pr, fill);
+            canvas.drawCircle(c.px, c.py, c.pr, outline);
             canvas.drawCircle(c.px, c.py, c.pr, stroke);
         }
-        text.setColor(c.pressed ? 0xFFFFFFFF : 0xC0FFFFFF);
+        text.setColor(0xF0FFFFFF);
         text.setTextSize(c.pr * (c.label.length() > 2 ? 0.55f : 0.9f));
         canvas.drawText(c.label, c.px, c.py - (text.descent() + text.ascent()) / 2f, text);
     }
 
     private void drawToggle(Canvas canvas) {
-        fill.setColor((toggle.pressed ? 0x70 : 0x30) << 24 | 0xFFFFFF);
+        fill.setColor(toggle.pressed ? 0x70FFFFFF : 0x40000000);
         stroke.setColor(0x90FFFFFF);
         canvas.drawCircle(toggle.px, toggle.py, toggle.pr, fill);
+        canvas.drawCircle(toggle.px, toggle.py, toggle.pr, outline);
         canvas.drawCircle(toggle.px, toggle.py, toggle.pr, stroke);
         // A small gamepad glyph: crossed out when the controls are hidden.
         float s = toggle.pr * 0.5f;
