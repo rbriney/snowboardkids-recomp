@@ -1,33 +1,77 @@
-# Snowboard Kids: Recompiled
+# Snowboard Kids: Recompiled for Android
 
-[Snowboard Kids: Recompiled](https://github.com/cdlewis/snowboardkids-recomp) is a project that uses [N64: Recompiled](https://github.com/Mr-Wiseguy/N64Recomp) to **statically recompile** Snowboard Kids into a native port with many new features, enhancements, and extensive mod support. This project uses [RT64](https://github.com/rt64/rt64) as the rendering engine to provide some of these enhancements.
+An Android port of [Snowboard Kids: Recompiled](https://github.com/cdlewis/snowboardkids-recomp) by cdlewis, which uses [N64: Recompiled](https://github.com/Mr-Wiseguy/N64Recomp) to **statically recompile** Snowboard Kids into a native game, rendered with [RT64](https://github.com/rt64/rt64). This port runs it natively on Android phones and tablets, with on-screen touch controls and controller support.
 
-### [Download the latest release here](https://github.com/cdlewis/snowboardkids-recomp/releases/latest) (Windows, macOS, Linux)
+### [Download the latest Android APK](https://github.com/rbriney/snowboardkids-recomp/releases/latest)
 
-### [Download the Android APK here](https://github.com/rbriney/snowboardkids-recomp/releases/latest) (Android, from this fork)
+Playing on Windows, macOS or Linux? Get those versions from the [original project's releases](https://github.com/cdlewis/snowboardkids-recomp/releases/latest).
 
-This fork adds an Android port. See [Android](#android) for requirements and how to install it.
+### **This repository and its releases do not contain game assets. You need your own copy of the North American (US) N64 release of Snowboard Kids.**
 
 Join the [Snowboard Kids Community Discord](https://discord.gg/PJzG4F8SpF) to discuss this and other Snowboard Kids games/projects.
 
 [![Discord Invitation](https://discordapp.com/api/guilds/729856662357278750/widget.png?style=banner2 "Snowboard Kids")](https://discord.gg/PJzG4F8SpF)
 
-### **This repository and its releases do not contain game assets. The original game is required to build or run this project.**
-
 ## Table of Contents
 
-- [System Requirements](#system-requirements)
-- [Android](#android)
-- [Features](#features)
-- [Planned Features](#planned-features)
-- [FAQ](#faq)
-- [Known Issues](#known-issues)
-- [Building](#building)
-- [Articles](#articles)
-- [Libraries Used and Projects Referenced](#libraries-used-and-projects-referenced)
+- [Installing](#installing)
+- [Requirements](#requirements)
+- [Controls](#controls)
+- [Android Notes](#android-notes)
+- [Building the Android Port](#building-the-android-port)
+- [About Snowboard Kids: Recompiled](#about-snowboard-kids-recompiled)
 - [Credits](#credits)
 
-## System Requirements
+## Installing
+
+The APK is installed directly ("sideloaded"); it is not on the Google Play Store.
+
+1. On your phone or tablet, download `SnowboardKidsRecompiled-Android-ARM64.apk` from the
+   [latest release](https://github.com/rbriney/snowboardkids-recomp/releases/latest).
+2. Open the downloaded file. Android will ask you to allow your browser or file manager to install unknown apps;
+   allow it, then tap **Install**. Play Protect may warn that the app is from an unknown developer; this is normal
+   for apps installed outside the Play Store.
+3. Copy your US Snowboard Kids ROM (`.z64`, `.n64` or `.v64`) onto the device, for example into **Downloads**.
+4. Launch **Snowboard Kids Recomp**, tap **Select ROM** and choose your ROM file. Then tap **Start game**.
+
+To update, install the newer APK over the old one; your saves and settings are kept.
+
+## Requirements
+
+- Android 8.0 or newer on a 64-bit ARM (arm64-v8a) phone or tablet
+- A GPU with Vulkan 1.2 support
+- Your own copy of the North American (US) N64 release of Snowboard Kids
+- Tested on a Google Pixel 9 (Tensor G4, Mali-G715). Other devices should work but are untested; please report issues.
+
+## Controls
+
+On-screen touch controls (analog stick, A, B, Z, the C-buttons for board grabs, and Start) appear when the game
+starts. The button at the top centre hides or shows them; they start hidden if a controller is connected.
+Bluetooth and USB controllers work too, and the D-pad also steers, so D-pad-only controllers can be used.
+
+## Android Notes
+
+- Only the US version of the game is supported on Android for now (the desktop versions also accept the Japanese one).
+- Saves, settings and mods are stored in `Android/data/com.snowboardkids.recomp/files` on the device's internal storage.
+- Mods with native code are not supported on Android.
+- Releases are signed with the same key, so each update installs over the previous version. Each release lists the
+  APK's SHA-256 checksum and the signing certificate fingerprint so you can verify your download.
+- This port fixed a Vulkan synchronisation bug in Plume (RT64's graphics layer) that corrupted textures on Mali GPUs;
+  the fix has been submitted upstream as [renderbag/plume#138](https://github.com/renderbag/plume/pull/138).
+
+## Building the Android Port
+
+Building is not required to play: the prebuilt APK (which contains no game assets) is in the
+[releases](https://github.com/rbriney/snowboardkids-recomp/releases/latest). To build it yourself, see
+[android/README.md](android/README.md), which builds on the general instructions in [BUILDING.md](BUILDING.md).
+
+## About Snowboard Kids: Recompiled
+
+The rest of this README comes from the [original project](https://github.com/cdlewis/snowboardkids-recomp) and
+describes Snowboard Kids: Recompiled in general. Most features apply on Android too; desktop-specific details
+(system requirements, portable mode, overlays) do not.
+
+### Desktop System Requirements
 
 A GPU supporting Direct3D 12.0 (Shader Model 6), Vulkan 1.2, or Metal Argument Buffers Tier 2 support is required to run this project. The oldest GPUs that should be supported for each vendor are:
 
@@ -42,37 +86,7 @@ Windows users should have the [Visual C++ Redistributable](https://learn.microso
 
 If you have issues with crashes on startup, make sure your graphics drivers are fully up to date.
 
-## Android
-
-The Android port is an APK you install directly ("sideload"); it is not on the Google Play Store. Like the desktop
-releases, **it does not contain the game: you need to provide your own copy of the North American (US) N64 release
-of Snowboard Kids.** The Android build does not support the Japanese version yet.
-
-#### Requirements
-
-- Android 8.0 or newer on a 64-bit ARM (arm64-v8a) phone or tablet
-- A GPU with Vulkan 1.2 support
-- Tested on a Google Pixel 9 (Tensor G4, Mali-G715). Other devices should work but are untested; please report issues.
-
-#### Installing
-
-1. On your phone or tablet, download `SnowboardKidsRecompiled-Android-ARM64.apk` from the
-   [latest release](https://github.com/rbriney/snowboardkids-recomp/releases/latest).
-2. Open the downloaded file. Android will ask you to allow your browser or file manager to install unknown apps;
-   allow it, then tap **Install**. Play Protect may warn that the app is from an unknown developer; this is normal
-   for apps installed outside the Play Store.
-3. Copy your US Snowboard Kids ROM (`.z64`, `.n64` or `.v64`) onto the device, for example into **Downloads**.
-4. Launch **Snowboard Kids Recomp**, tap **Select ROM** and choose your ROM file. Then tap **Start game**.
-
-To update, install the newer APK over the old one; your saves and settings are kept.
-
-#### Controls
-
-On-screen touch controls (analog stick, A, B, Z, the C-buttons for board grabs, and Start) appear when the game
-starts. The button at the top centre hides or shows them; they start hidden if a controller is connected.
-Bluetooth and USB controllers work too, and the D-pad also steers, so D-pad-only controllers can be used.
-
-## Features
+### Features
 
 #### Plug and Play
 
@@ -120,12 +134,12 @@ Saving and loading files, going from place to place, and pausing all happen in t
 
 A Linux binary as well as a Flatpak is available for playing on most up-to-date distros, including on the Steam Deck.
 
-## Planned Features
+### Planned Features
 
 - Split-screen multiplayer support
 - Ray Tracing and Higher Quality Model Replacements (via RT64)
 
-## FAQ
+### FAQ
 
 #### What is static recompilation?
 
@@ -140,7 +154,6 @@ Unlike N64 ports in the past, this project is not based on the source code provi
 - Windows: `%LOCALAPPDATA%\SnowboardKidsRecompiled\saves`
 - Linux: `~/.config/SnowboardKidsRecompiled/saves`
 - macOS: `~/Library/Application Support/SnowboardKidsRecompiled/saves`
-- Android: `Android/data/com.snowboardkids.recomp/files/saves` on the device's internal storage
 
 #### How do I choose a different ROM?
 
@@ -150,18 +163,15 @@ This project accepts the US and Japanese versions of the N64 release of Snowboar
 
 Yes, if you place a file named `portable.txt` in the same folder as the executable then this project will run in portable mode. In portable mode, the save files, config files, and mods are placed in the same folder as the executable.
 
-## Known Issues
+### Known Issues
 
 - Overlays such as MSI Afterburner and other software such as Wallpaper Engine can cause performance issues with this project that prevent the game from rendering correctly. Disabling such software is recommended.
-- Android: only the US version of the game is supported, and the port has only been tested on a Pixel 9 (Mali GPU). Mods with native code are not supported on Android.
 
-## Building
+### Building
 
 Building is not required to play this project, as prebuilt binaries (which do not contain game assets) can be found in the [Releases](https://github.com/cdlewis/snowboardkids-recomp/releases/latest) section. Instructions on how to build this project can be found in the [BUILDING.md](BUILDING.md) file.
 
-The Android APK is likewise available prebuilt in [this fork's releases](https://github.com/rbriney/snowboardkids-recomp/releases/latest). To build it yourself, see [android/README.md](android/README.md).
-
-## Libraries Used and Projects Referenced
+### Libraries Used and Projects Referenced
 
 - [Snowboard Kids Decompilation](https://github.com/cdlewis/snowboardkids-decomp) for headers and some function definitions, used for making patches or some enhancements
 - [RT64](https://github.com/rt64/rt64) for the project's rendering engine
@@ -173,6 +183,13 @@ The Android APK is likewise available prebuilt in [this fork's releases](https:/
 - [Ares emulator](https://github.com/ares-emulator/ares) for RSP vector instruction reference implementations, used in RSP recompilation
 
 ## Credits
+
+Android port:
+
+- Based on the Snowboard Kids 2 Android port by [kardeiro](https://github.com/kardeiro/snowboardkids2-recomp-Android), which uses the same RT64, N64ModernRuntime and RecompFrontend libraries, with reference to [linkzenic's Zelda64Recomp Android port](https://github.com/linkzenic/Zelda64Recomp-Android).
+- [SDL](https://github.com/libsdl-org/SDL) for the Android activity, input and virtual touch controller.
+
+Original project:
 
 - M. Lee Lunsford for designing an amazing launcher background.
 - [Bl00D4NGEL](https://github.com/Bl00D4NGEL): for significant contributions to the [Snowboard Kids decompilation project](https://github.com/cdlewis/snowboardkids-decomp).
