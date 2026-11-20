@@ -136,6 +136,50 @@ if (RECOMP_FLATPAK)
     add_compile_definitions(RECOMP_FLATPAK)
 endif()
 
+if (ANDROID)
+    # Android build: everything links into one shared library (libSnowboardKidsRecompiled.so)
+    # loaded by SDLActivity. Adapted from the Snowboard Kids 2 Android port
+    # (kardeiro/snowboardkids2-recomp-Android). See android/README.md.
+    set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+    include(FetchContent)
+
+    # SDL2 from source, linked statically (provides JNI_OnLoad and the SDLActivity natives).
+    set(SDL2_VERSION "2.30.9")
+    set(SDL_SHARED OFF CACHE BOOL "" FORCE)
+    set(SDL_STATIC ON CACHE BOOL "" FORCE)
+    set(SDL_TEST_LIBRARY OFF CACHE BOOL "" FORCE)
+    set(SDL_TESTS OFF CACHE BOOL "" FORCE)
+    set(SDL_VIDEO_VULKAN ON CACHE BOOL "" FORCE)
+    FetchContent_Declare(sdl2
+        URL https://github.com/libsdl-org/SDL/archive/refs/tags/release-${SDL2_VERSION}.tar.gz
+        DOWNLOAD_EXTRACT_TIMESTAMP TRUE)
+    FetchContent_MakeAvailable(sdl2)
+    # Some code includes <SDL2/SDL.h>; SDL's source tree has its headers flat in include/.
+    file(MAKE_DIRECTORY "${CMAKE_BINARY_DIR}/sdl2_wrap/SDL2")
+    file(GLOB SK1_SDL_HEADERS "${sdl2_SOURCE_DIR}/include/*.h")
+    file(COPY ${SK1_SDL_HEADERS} DESTINATION "${CMAKE_BINARY_DIR}/sdl2_wrap/SDL2")
+    set(SDL2_INCLUDE_DIRS "${sdl2_SOURCE_DIR}/include" "${CMAKE_BINARY_DIR}/sdl2_wrap")
+    set(SDL2_LIBRARIES SDL2-static)
+    include_directories(${SDL2_INCLUDE_DIRS})
+
+    # FreeType from source (RmlUi text rendering).
+    set(FT_DISABLE_ZLIB ON CACHE BOOL "" FORCE)
+    set(FT_DISABLE_BZIP2 ON CACHE BOOL "" FORCE)
+    set(FT_DISABLE_PNG ON CACHE BOOL "" FORCE)
+    set(FT_DISABLE_HARFBUZZ ON CACHE BOOL "" FORCE)
+    set(FT_DISABLE_BROTLI ON CACHE BOOL "" FORCE)
+    FetchContent_Declare(freetype
+        URL https://github.com/freetype/freetype/archive/refs/tags/VER-2-13-3.tar.gz
+        DOWNLOAD_EXTRACT_TIMESTAMP TRUE)
+    FetchContent_MakeAvailable(freetype)
+    set(FREETYPE_INCLUDE_DIRS "${freetype_SOURCE_DIR}/include")
+    # RmlUi's find_package(Freetype) turns this into an imported library, so it must be the archive path.
+    set(FREETYPE_LIBRARY "${freetype_BINARY_DIR}/libfreetype.a" CACHE FILEPATH "" FORCE)
+    set(FREETYPE_LIBRARIES freetype)
+
+    add_compile_definitions("PLUME_SDL_VULKAN_ENABLED" "RT64_SDL_WINDOW_VULKAN")
+endif()
+
 add_subdirectory(${CMAKE_SOURCE_DIR}/lib/rt64 ${CMAKE_BINARY_DIR}/rt64)
 
 set(BUILD_SHARED_LIBS OFF)
@@ -188,11 +232,16 @@ if(WIN32)
     include(cmake/WindowsCrashpad.cmake)
 endif()
 
-# Main executable
-add_executable(SnowboardKidsRecompiled)
+# Main executable (a shared library loaded by SDLActivity on Android)
+if (ANDROID)
+    add_library(SnowboardKidsRecompiled SHARED)
+else()
+    add_executable(SnowboardKidsRecompiled)
+endif()
 if(WIN32)
     target_link_libraries(SnowboardKidsRecompiled PRIVATE sk1_crash_reports)
-    sk1_stage_crashpad(SnowboardKidsRecompiled)    enable_testing()
+    sk1_stage_crashpad(SnowboardKidsRecompiled)
+    enable_testing()
     add_subdirectory(tests/windows-crash-reports EXCLUDE_FROM_ALL)
 endif()
 
@@ -218,6 +267,13 @@ set (SOURCES
 
 if (APPLE)
     list(APPEND SOURCES ${CMAKE_SOURCE_DIR}/src/main/support_apple.mm)
+endif()
+
+if (ANDROID)
+    list(APPEND SOURCES
+        ${CMAKE_SOURCE_DIR}/src/main/sk1_android.cpp
+        ${CMAKE_SOURCE_DIR}/src/main/sk1_android_jni.cpp
+    )
 endif()
 
 target_include_directories(SnowboardKidsRecompiled PRIVATE
@@ -369,6 +425,14 @@ if (CMAKE_SYSTEM_NAME MATCHES "Linux")
     target_link_libraries(SnowboardKidsRecompiled PRIVATE "-latomic -static-libstdc++" ${CMAKE_DL_LIBS} Threads::Threads)
 endif()
 
+if (ANDROID)
+    target_include_directories(SnowboardKidsRecompiled PRIVATE ${SDL2_INCLUDE_DIRS} ${FREETYPE_INCLUDE_DIRS})
+    target_link_libraries(SnowboardKidsRecompiled PRIVATE
+        ${SDL2_LIBRARIES} ${FREETYPE_LIBRARIES} ${CMAKE_DL_LIBS} android log)
+    # Android 15+ devices may use 16 KB memory pages; NDK r26 aligns to 4 KB by default.
+    target_link_options(SnowboardKidsRecompiled PRIVATE "-Wl,-z,max-page-size=16384")
+endif()
+
 # TODO fix the rt64 CMake script so that this doesn't need to be duplicated here
 # For DXC
 set (DXC_COMMON_OPTS "-I${PROJECT_SOURCE_DIR}/src")
@@ -383,6 +447,9 @@ set (DXC_RT_OPTS "${DXC_COMMON_OPTS}" "-D" "RT_SHADER" "-T" "lib_6_3" "-fspv-tar
 if (${WIN32})
     set (DXC "${PROJECT_SOURCE_DIR}/lib/rt64/src/contrib/dxc/bin/x64/dxc.exe")
     add_compile_definitions(NOMINMAX)
+elseif (ANDROID AND CMAKE_HOST_WIN32)
+    # DXC is a host tool when cross-compiling for Android.
+    set (DXC "${PROJECT_SOURCE_DIR}/lib/rt64/src/contrib/dxc/bin/x64/dxc.exe")
 else()
     if (APPLE)
         # Apple's binary is universal, so it'll work on both x86_64 and arm64
@@ -412,6 +479,11 @@ target_include_directories(recompui BEFORE PRIVATE
 target_include_directories(recompinput BEFORE PRIVATE
     ${CMAKE_SOURCE_DIR}/lib/N64ModernRuntime/thirdparty
 )
+
+if (ANDROID)
+    # The Android RecompFrontend patch calls into the game's Android glue (sk1_android.h).
+    target_include_directories(recompui PRIVATE ${CMAKE_SOURCE_DIR}/src/main)
+endif()
 
 if(SK1_ENABLE_JP)
     target_sources(SnowboardKidsRecompiled PRIVATE
@@ -463,7 +535,7 @@ endif()
 
 target_sources(SnowboardKidsRecompiled PRIVATE ${SOURCES})
 
-if (WIN32 OR CMAKE_SYSTEM_NAME STREQUAL "Linux")
+if (WIN32 OR ANDROID OR CMAKE_SYSTEM_NAME STREQUAL "Linux")
     # Refresh runtime assets even when the executable does not need to relink.
     add_custom_target(StageRuntimeAssets
         COMMAND ${CMAKE_COMMAND}

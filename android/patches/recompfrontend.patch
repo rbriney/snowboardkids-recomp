@@ -1,0 +1,401 @@
+diff --git a/lib/SlotMap/slot_map.h b/lib/SlotMap/slot_map.h
+index 467c01b..55f33bc 100644
+--- a/lib/SlotMap/slot_map.h
++++ b/lib/SlotMap/slot_map.h
+@@ -45,6 +45,18 @@
+ #include <xmmintrin.h>
+ #define SLOT_MAP_ALLOC(sizeInBytes, alignment) _mm_malloc(sizeInBytes, alignment)
+ #define SLOT_MAP_FREE(ptr) _mm_free(ptr)
++#elif defined(__ANDROID__)
++// Android: aligned_alloc is not declared until API 28, use posix_memalign instead.
++#include <stdlib.h>
++static inline void* slot_map_aligned_alloc(size_t sizeInBytes, size_t alignment) {
++    void* p = nullptr;
++    if (posix_memalign(&p, alignment, sizeInBytes) != 0) {
++        return nullptr;
++    }
++    return p;
++}
++#define SLOT_MAP_ALLOC(sizeInBytes, alignment) slot_map_aligned_alloc(sizeInBytes, alignment)
++#define SLOT_MAP_FREE(ptr) free(ptr)
+ #else
+ // Posix
+ #include <stdlib.h>
+diff --git a/recompinput/CMakeLists.txt b/recompinput/CMakeLists.txt
+index 899372b..051b892 100644
+--- a/recompinput/CMakeLists.txt
++++ b/recompinput/CMakeLists.txt
+@@ -42,7 +42,7 @@ target_include_directories(recompinput PRIVATE
+ 
+ if (WIN32)
+     target_include_directories(recompinput PRIVATE ${sdl2_SOURCE_DIR}/include)
+-elseif (APPLE OR CMAKE_SYSTEM_NAME MATCHES "Linux")
++elseif (APPLE OR CMAKE_SYSTEM_NAME MATCHES "Linux" OR ANDROID)
+     target_include_directories(recompinput PRIVATE ${SDL2_INCLUDE_DIRS})
+ endif()
+ 
+diff --git a/recompinput/include/recompinput/recompinput.h b/recompinput/include/recompinput/recompinput.h
+index bf50055..bfa5ddc 100644
+--- a/recompinput/include/recompinput/recompinput.h
++++ b/recompinput/include/recompinput/recompinput.h
+@@ -3,6 +3,7 @@
+ #include "SDL.h"
+ #include "chrono"
+ #include <mutex>
++#include <string>
+ 
+ namespace recompinput {
+     // Shared with the UI state lock. Hold across multi-call input/profile transactions and borrowed references.
+diff --git a/recompui/CMakeLists.txt b/recompui/CMakeLists.txt
+index b9c5458..267e216 100644
+--- a/recompui/CMakeLists.txt
++++ b/recompui/CMakeLists.txt
+@@ -103,7 +103,7 @@ target_include_directories(recompui PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include
+ 
+ if (WIN32)
+     target_include_directories(recompui PRIVATE ${sdl2_SOURCE_DIR}/include)
+-elseif (APPLE OR CMAKE_SYSTEM_NAME MATCHES "Linux")
++elseif (APPLE OR CMAKE_SYSTEM_NAME MATCHES "Linux" OR ANDROID)
+     target_include_directories(recompui PRIVATE ${SDL2_INCLUDE_DIRS})
+ endif()
+ 
+diff --git a/recompui/include/recompui/recompui.h b/recompui/include/recompui/recompui.h
+index 87caf66..7af3206 100644
+--- a/recompui/include/recompui/recompui.h
++++ b/recompui/include/recompui/recompui.h
+@@ -76,6 +76,19 @@ namespace recompui {
+         ButtonStyle cancel_variant = ButtonStyle::Danger,
+         bool focus_on_cancel = true
+     );
++    void open_choice_prompt_with_dismiss(
++        const std::string& header_text,
++        const std::string& content_text,
++        const std::string& confirm_label_text,
++        const std::string& cancel_label_text,
++        const std::string& dismiss_label_text,
++        std::function<void()> confirm_action,
++        std::function<void()> cancel_action,
++        std::function<void()> dismiss_action,
++        ButtonStyle confirm_variant = ButtonStyle::Success,
++        ButtonStyle cancel_variant = ButtonStyle::Danger,
++        ButtonStyle dismiss_variant = ButtonStyle::Tertiary
++    );
+     void open_info_prompt(
+         const std::string& header_text,
+         const std::string& content_text,
+diff --git a/recompui/src/base/ui_state.cpp b/recompui/src/base/ui_state.cpp
+index 6e231d0..a0161fd 100644
+--- a/recompui/src/base/ui_state.cpp
++++ b/recompui/src/base/ui_state.cpp
+@@ -5,6 +5,8 @@
+ #include <SDL2/SDL_video.h>
+ #endif
+ #include <chrono>
++#include <sstream>
++#include <fstream>
+ 
+ #include "rt64_render_hooks.h"
+ 
+diff --git a/recompui/src/composites/ui_prompt.cpp b/recompui/src/composites/ui_prompt.cpp
+index eba4f5e..c1c65d4 100644
+--- a/recompui/src/composites/ui_prompt.cpp
++++ b/recompui/src/composites/ui_prompt.cpp
+@@ -17,8 +17,10 @@ struct {
+     recompui::Element* prompt_controls = nullptr;
+     recompui::Button* confirm_button = nullptr;
+     recompui::Button* cancel_button = nullptr;
++    recompui::Button* dismiss_button = nullptr;
+     std::function<void()> confirm_action;
+     std::function<void()> cancel_action;
++    std::function<void()> dismiss_action;
+     std::mutex mutex;
+ } prompt_state;
+ 
+@@ -49,6 +51,18 @@ void run_cancel_callback() {
+     // or just remove it as the usage of the prompt can change now
+ }
+ 
++void run_dismiss_callback() {
++    std::function<void()> dismiss_action;
++    {
++        std::lock_guard lock{ prompt_state.mutex };
++        dismiss_action = std::move(prompt_state.dismiss_action);
++    }
++    if (dismiss_action) {
++        dismiss_action();
++    }
++    recompui::hide_context(prompt_state.ui_context);
++}
++
+ void apply_prompt_button_style(recompui::Button *button) {
+     const auto &style = recompui::theme::get_frontend_theme().prompt.button;
+     static_cast<recompui::Style&>(*button).apply_style(style.normal);
+@@ -69,6 +83,7 @@ void apply_prompt_theme() {
+     prompt_state.prompt_controls->apply_style(style.controls);
+     apply_prompt_button_style(prompt_state.confirm_button);
+     apply_prompt_button_style(prompt_state.cancel_button);
++    apply_prompt_button_style(prompt_state.dismiss_button);
+ }
+ 
+ void recompui::init_prompt_context() {
+@@ -147,6 +162,10 @@ void recompui::init_prompt_context() {
+     prompt_state.cancel_button->set_min_width(185.0f, Unit::Dp);
+     prompt_state.cancel_button->add_pressed_callback(run_cancel_callback);
+ 
++    prompt_state.dismiss_button = context.create_element<Button>(prompt_state.prompt_controls, "", ButtonStyle::Tertiary);
++    prompt_state.dismiss_button->set_min_width(185.0f, Unit::Dp);
++    prompt_state.dismiss_button->add_pressed_callback(run_dismiss_callback);
++
+     apply_prompt_theme();
+ 
+     context.close();
+@@ -196,10 +215,12 @@ void recompui::open_choice_prompt(
+     prompt_state.prompt_controls->set_display(Display::Flex);
+     prompt_state.confirm_button->set_display(Display::Flex);
+     prompt_state.cancel_button->set_display(Display::Flex);
++    prompt_state.dismiss_button->set_display(Display::None);
+     prompt_state.confirm_button->set_text(confirm_label_text);
+     prompt_state.cancel_button->set_text(cancel_label_text);
+     prompt_state.confirm_action = confirm_action;
+     prompt_state.cancel_action = cancel_action;
++    prompt_state.dismiss_action = {};
+     prompt_state.confirm_button->apply_button_style(confirm_variant);
+     prompt_state.cancel_button->apply_button_style(cancel_variant);
+     apply_prompt_button_style(prompt_state.confirm_button);
+@@ -226,6 +247,55 @@ void recompui::open_choice_prompt(
+     show_prompt(prev_cancel_action, focus_on_cancel);
+ }
+ 
++void recompui::open_choice_prompt_with_dismiss(
++    const std::string& header_text,
++    const std::string& content_text,
++    const std::string& confirm_label_text,
++    const std::string& cancel_label_text,
++    const std::string& dismiss_label_text,
++    std::function<void()> confirm_action,
++    std::function<void()> cancel_action,
++    std::function<void()> dismiss_action,
++    ButtonStyle confirm_variant,
++    ButtonStyle cancel_variant,
++    ButtonStyle dismiss_variant
++) {
++    std::lock_guard lock{ prompt_state.mutex };
++
++    std::function<void()> prev_cancel_action = std::move(prompt_state.cancel_action);
++
++    ContextId prev_context = try_close_current_context();
++
++    prompt_state.ui_context.open();
++
++    prompt_state.prompt_header->set_text(header_text);
++    prompt_state.prompt_label->set_text(content_text);
++    prompt_state.prompt_controls->set_display(Display::Flex);
++    prompt_state.confirm_button->set_display(Display::Flex);
++    prompt_state.cancel_button->set_display(Display::Flex);
++    prompt_state.dismiss_button->set_display(Display::Flex);
++    prompt_state.confirm_button->set_text(confirm_label_text);
++    prompt_state.cancel_button->set_text(cancel_label_text);
++    prompt_state.dismiss_button->set_text(dismiss_label_text);
++    prompt_state.confirm_action = confirm_action;
++    prompt_state.cancel_action = cancel_action;
++    prompt_state.dismiss_action = dismiss_action;
++    prompt_state.confirm_button->apply_button_style(confirm_variant);
++    prompt_state.cancel_button->apply_button_style(cancel_variant);
++    prompt_state.dismiss_button->apply_button_style(dismiss_variant);
++    apply_prompt_button_style(prompt_state.confirm_button);
++    apply_prompt_button_style(prompt_state.cancel_button);
++    apply_prompt_button_style(prompt_state.dismiss_button);
++
++    prompt_state.ui_context.close();
++
++    if (prev_context != ContextId::null()) {
++        prev_context.open();
++    }
++
++    show_prompt(prev_cancel_action, false);
++}
++
+ void recompui::open_info_prompt(
+     const std::string& header_text,
+     const std::string& content_text,
+@@ -246,9 +316,11 @@ void recompui::open_info_prompt(
+     prompt_state.prompt_controls->set_display(Display::Flex);
+     prompt_state.confirm_button->set_display(Display::None);
+     prompt_state.cancel_button->set_display(Display::Flex);
++    prompt_state.dismiss_button->set_display(Display::None);
+     prompt_state.cancel_button->set_text(okay_label_text);
+     prompt_state.confirm_action = {};
+     prompt_state.cancel_action = okay_action;
++    prompt_state.dismiss_action = {};
+ 
+     prompt_state.cancel_button->apply_button_style(okay_variant);
+     apply_prompt_button_style(prompt_state.cancel_button);
+@@ -279,8 +351,10 @@ void recompui::open_notification(
+     prompt_state.prompt_controls->set_display(Display::None);
+     prompt_state.confirm_button->set_display(Display::None);
+     prompt_state.cancel_button->set_display(Display::None);
++    prompt_state.dismiss_button->set_display(Display::None);
+     prompt_state.confirm_action = {};
+     prompt_state.cancel_action = {};
++    prompt_state.dismiss_action = {};
+ 
+     prompt_state.ui_context.close();
+ 
+diff --git a/recompui/src/config/ui_config_tab_graphics.cpp b/recompui/src/config/ui_config_tab_graphics.cpp
+index 7332f2f..0c6ee2a 100644
+--- a/recompui/src/config/ui_config_tab_graphics.cpp
++++ b/recompui/src/config/ui_config_tab_graphics.cpp
+@@ -15,7 +15,12 @@ namespace recompui {
+         }
+ 
+         static ultramodern::renderer::WindowMode wm_default() {
++#if defined(__ANDROID__)
++            // Handheld devices have no desktop window chrome, always default to fullscreen.
++            return ultramodern::renderer::WindowMode::Fullscreen;
++#else
+             return is_steam_deck() ? ultramodern::renderer::WindowMode::Fullscreen : ultramodern::renderer::WindowMode::Windowed;
++#endif
+         }
+ 
+         using EnumOptionVector = const std::vector<recomp::config::ConfigOptionEnumOption>;
+diff --git a/recompui/src/core/ui_context.cpp b/recompui/src/core/ui_context.cpp
+index e99229a..1f586c8 100644
+--- a/recompui/src/core/ui_context.cpp
++++ b/recompui/src/core/ui_context.cpp
+@@ -236,11 +236,17 @@ void recompui::init_styling(const std::filesystem::path& rcss_file) {
+     std::string style{};
+     {
+         std::ifstream style_stream{rcss_file};
+-        style_stream.seekg(0, std::ios::end);
+-        style.resize(style_stream.tellg());
+-        style_stream.seekg(0, std::ios::beg);
+-
+-        style_stream.read(style.data(), style.size());
++        if (style_stream) {
++            style_stream.seekg(0, std::ios::end);
++            const std::streamoff size = style_stream.tellg();
++            style_stream.seekg(0, std::ios::beg);
++            // Guard against a failed tellg() (e.g. an unreadable path), which
++            // would otherwise resize() to a huge length and throw.
++            if (size > 0) {
++                style.resize(static_cast<std::size_t>(size));
++                style_stream.read(style.data(), style.size());
++            }
++        }
+     }
+     std::unique_ptr<Rml::StreamMemory> rml_stream = std::make_unique<Rml::StreamMemory>(reinterpret_cast<Rml::byte*>(style.data()), style.size());
+     rml_stream->SetSourceURL(rcss_file.filename().string());
+diff --git a/recompui/src/renderer/ui_renderer.cpp b/recompui/src/renderer/ui_renderer.cpp
+index 5ca5349..05bac53 100644
+--- a/recompui/src/renderer/ui_renderer.cpp
++++ b/recompui/src/renderer/ui_renderer.cpp
+@@ -109,7 +109,12 @@ class RmlRenderInterface_RT64_impl : public Rml::RenderInterfaceCompatibility {
+     static constexpr uint32_t initial_index_buffer_size = 1024 * sizeof(int);
+     static constexpr plume::RenderFormat RmlTextureFormat = plume::RenderFormat::R8G8B8A8_UNORM;
+     static constexpr plume::RenderFormat RmlTextureFormatBgra = plume::RenderFormat::B8G8R8A8_UNORM;
++#if defined(__ANDROID__)
++    // Must match RT64's Android swap chain format (RGBA8).
++    static constexpr plume::RenderFormat SwapChainFormat = plume::RenderFormat::R8G8B8A8_UNORM;
++#else
+     static constexpr plume::RenderFormat SwapChainFormat = plume::RenderFormat::B8G8R8A8_UNORM;
++#endif
+     static constexpr uint32_t RmlTextureFormatBytesPerPixel = RenderFormatSize(RmlTextureFormat);
+     static_assert(RenderFormatSize(RmlTextureFormatBgra) == RmlTextureFormatBytesPerPixel);
+     plume::RenderInterface* interface_;
+diff --git a/recompui/src/util/file.cpp b/recompui/src/util/file.cpp
+index fc7275d..a0878f0 100644
+--- a/recompui/src/util/file.cpp
++++ b/recompui/src/util/file.cpp
+@@ -10,7 +10,9 @@
+ #include <fstream>
+ #include <iomanip>
+ 
+-#if defined(_WIN32)
++#if defined(__ANDROID__)
++#include "sk1_android.h"
++#elif defined(_WIN32)
+ #include <Shlobj.h>
+ #elif defined(__linux__)
+ #include <unistd.h>
+@@ -21,6 +23,11 @@
+ 
+ namespace recompui {
+     static void perform_file_dialog_operation(const std::function<void(bool, const std::filesystem::path&)>& callback) {
++#if defined(__ANDROID__)
++        sk1android::file_dialog_result result;
++        sk1android::open_file_dialog(false, result);
++        callback(result.success, result.path);
++#else
+         const nfdu8filteritem_t filter = {"Nintendo 64 ROM files", "z64,n64,v64"};
+         nfdu8char_t* native_path = nullptr;
+         nfdresult_t result = NFD_OpenDialogU8(&native_path, &filter, 1, nullptr);
+@@ -34,9 +41,15 @@ namespace recompui {
+         }
+ 
+         callback(success, path);
++#endif
+     }
+ 
+     static void perform_file_dialog_operation_multiple(const std::function<void(bool, const std::list<std::filesystem::path>&)>& callback) {
++#if defined(__ANDROID__)
++        sk1android::file_dialog_result result;
++        sk1android::open_file_dialog(true, result);
++        callback(result.success, result.paths);
++#else
+         const nfdpathset_t* native_paths = nullptr;
+         nfdresult_t result = NFD_OpenDialogMultipleN(&native_paths, nullptr, 0, nullptr);
+ 
+@@ -57,6 +70,7 @@ namespace recompui {
+         }
+ 
+         callback(success, paths);
++#endif
+     }
+ 
+     std::filesystem::path file::get_app_folder_path() {
+@@ -65,7 +79,9 @@ namespace recompui {
+             return std::filesystem::current_path();
+         }
+ 
+-#if defined(__APPLE__)
++#if defined(__ANDROID__)
++        return sk1android::external_root();
++#elif defined(__APPLE__)
+         // Check for portable file in the directory containing the app bundle.
+         const auto app_bundle_path = file::apple::get_bundle_directory().parent_path();
+         if (std::filesystem::exists(app_bundle_path / "portable.txt")) {
+@@ -84,7 +100,7 @@ namespace recompui {
+         }
+ 
+         CoTaskMemFree(known_path);
+-#elif defined(__linux__) || defined(__APPLE__)
++#elif (defined(__linux__) && !defined(__ANDROID__)) || defined(__APPLE__)
+         // check for APP_FOLDER_PATH env var
+         if (getenv("APP_FOLDER_PATH") != nullptr) {
+             return std::filesystem::path{getenv("APP_FOLDER_PATH")};
+@@ -116,7 +132,9 @@ namespace recompui {
+     }
+ 
+     std::filesystem::path file::get_program_path() {
+-#if defined(__APPLE__)
++#if defined(__ANDROID__)
++        return sk1android::asset_root();
++#elif defined(__APPLE__)
+         return file::apple::get_bundle_resource_directory();
+ #elif defined(__linux__) && defined(RECOMP_FLATPAK)
+         return "/app/bin";
+@@ -126,7 +144,14 @@ namespace recompui {
+     }
+ 
+     std::filesystem::path file::get_asset_path(const char* asset) {
++#if defined(__ANDROID__)
++        // asset_root() already points at the assets directory (the files were
++        // extracted from the APK to internal/assets). Do not append "assets"
++        // again, otherwise paths become .../assets/assets/<file>.
++        return sk1android::asset_root() / asset;
++#else
+         return file::get_program_path() / "assets" / asset;
++#endif
+     }
+ 
+     void file::open_file_dialog(std::function<void(bool success, const std::filesystem::path& path)> callback) {

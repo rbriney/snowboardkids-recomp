@@ -1,0 +1,84 @@
+// Packages the natively built libSnowboardKidsRecompiled.so and runtime assets into an APK.
+// The native library is built separately with CMake + the NDK (see android/README.md);
+// set SK1_NATIVE_BUILD_DIR to that build directory (default: ../build-android).
+// Adapted from the Snowboard Kids 2 Android port (kardeiro/snowboardkids2-recomp-Android).
+plugins {
+    id 'com.android.application'
+}
+
+def nativeBuildDir = System.getenv('SK1_NATIVE_BUILD_DIR') ?: rootProject.file('../build-android').absolutePath
+
+android {
+    namespace 'com.snowboardkids.recomp'
+    compileSdk 34
+    ndkVersion '26.3.11579264'
+
+    defaultConfig {
+        applicationId 'com.snowboardkids.recomp'
+        minSdk 26
+        targetSdk 34
+        versionCode 1
+        versionName '0.1.0-android'
+        ndk {
+            abiFilters 'arm64-v8a'
+        }
+    }
+
+    signingConfigs {
+        // Release signing comes from environment variables; local builds use the debug key.
+        release {
+            if (System.getenv('SK1_KEYSTORE_PATH')) {
+                storeFile file(System.getenv('SK1_KEYSTORE_PATH'))
+                storePassword System.getenv('SK1_KEYSTORE_PASSWORD')
+                keyAlias System.getenv('SK1_KEY_ALIAS')
+                keyPassword System.getenv('SK1_KEY_PASSWORD')
+            }
+        }
+    }
+
+    buildTypes {
+        debug {
+            // The native library is always an optimised build; do not strip it so crashes symbolise.
+            debuggable true
+        }
+        release {
+            minifyEnabled false
+            signingConfig System.getenv('SK1_KEYSTORE_PATH') ? signingConfigs.release : signingConfigs.debug
+        }
+    }
+
+    sourceSets {
+        main {
+            // Fonts, rcss, images staged by the CMake StageRuntimeAssets target.
+            assets.srcDirs += ["${nativeBuildDir}/assets"]
+        }
+    }
+
+    packagingOptions {
+        jniLibs {
+            // Keep the .so uncompressed and unstripped (debug symbols for crash logs).
+            useLegacyPackaging true
+            keepDebugSymbols += ['**/libSnowboardKidsRecompiled.so']
+        }
+    }
+}
+
+tasks.register('copyNativeLib', Copy) {
+    from(nativeBuildDir) {
+        include 'libSnowboardKidsRecompiled.so'
+    }
+    into layout.projectDirectory.dir('src/main/jniLibs/arm64-v8a')
+    doFirst {
+        if (!new File(nativeBuildDir, 'libSnowboardKidsRecompiled.so').exists()) {
+            throw new GradleException("libSnowboardKidsRecompiled.so not found in ${nativeBuildDir}; build it first.")
+        }
+    }
+}
+
+// The controller database must sit at the root of the extracted assets (get_program_path()).
+tasks.register('copyControllerDb', Copy) {
+    from(rootProject.file('../recompcontrollerdb.txt'))
+    into layout.projectDirectory.dir('src/main/assets')
+}
+
+preBuild.dependsOn copyNativeLib, copyControllerDb

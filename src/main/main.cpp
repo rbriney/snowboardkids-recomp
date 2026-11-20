@@ -93,6 +93,10 @@ ultramodern::gfx_callbacks_t::gfx_data_t create_gfx() {
     SDL_SetHint(SDL_HINT_JOYSTICK_HIDAPI_PS5_RUMBLE, "1");
     SDL_SetHint(SDL_HINT_MOUSE_FOCUS_CLICKTHROUGH, "1");
     SDL_SetHint(SDL_HINT_JOYSTICK_ALLOW_BACKGROUND_EVENTS, "1");
+#if defined(__ANDROID__)
+    // The game renders landscape only.
+    SDL_SetHint(SDL_HINT_ORIENTATIONS, "LandscapeLeft LandscapeRight");
+#endif
 
     if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_GAMECONTROLLER) < 0) {
         exit_error("Failed to initialize SDL2: %s\n", SDL_GetError());
@@ -226,7 +230,11 @@ ultramodern::renderer::WindowHandle create_window(ultramodern::gfx_callbacks_t::
     // cannot drift from zelda64::program_name the way the inherited literal did.
     window = SDL_CreateWindow(std::string{ zelda64::program_name }.c_str(), SDL_WINDOWPOS_CENTERED,
                               SDL_WINDOWPOS_CENTERED, window_width, window_height, flags);
-#if defined(__linux__)
+#if defined(__ANDROID__)
+    // No window chrome on a phone: always run immersive so the system bars do not
+    // overlay the render surface.
+    SDL_SetWindowFullscreen(window, SDL_WINDOW_FULLSCREEN_DESKTOP);
+#elif defined(__linux__)
     SetImageAsIcon("icons/512.png", window);
     if (ultramodern::renderer::get_graphics_config().wm_option ==
         ultramodern::renderer::WindowMode::Fullscreen) { // TODO: Remove once RT64 gets native fullscreen support on
@@ -760,7 +768,12 @@ bool get_sk1_n64_input(int controller_num, uint16_t* buttons_out, float* x_out, 
 
 #define REGISTER_FUNC(name) recomp::overlays::register_base_export(#name, name)
 
+#if defined(__ANDROID__)
+// SDLActivity looks up and calls SDL_main (C linkage, declared by SDL_main.h).
+int SDL_main(int argc, char** argv) {
+#else
 int main(int argc, char** argv) {
+#endif
     sk1::initialize_game_restart(argc, argv);
     recompui::programconfig::set_program_name(std::string{ zelda64::program_name });
     recompui::programconfig::set_program_id(std::u8string{ zelda64::program_id });

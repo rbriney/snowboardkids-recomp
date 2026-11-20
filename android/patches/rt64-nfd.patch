@@ -1,0 +1,165 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 86873e8..32dcced 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -15,6 +15,8 @@ if(WIN32)
+   set(nfd_PLATFORM PLATFORM_WIN32)
+ elseif(APPLE)
+   set(nfd_PLATFORM PLATFORM_MACOS)
++elseif(ANDROID)
++  set(nfd_PLATFORM PLATFORM_ANDROID)
+ elseif(UNIX AND NOT APPLE)
+   set(nfd_PLATFORM PLATFORM_LINUX)
+ endif()
+diff --git a/src/CMakeLists.txt b/src/CMakeLists.txt
+index f83c583..e431ea6 100644
+--- a/src/CMakeLists.txt
++++ b/src/CMakeLists.txt
+@@ -25,6 +25,12 @@ if(nfd_PLATFORM STREQUAL PLATFORM_LINUX)
+   endif()
+ endif()
+ 
++if(nfd_PLATFORM STREQUAL PLATFORM_ANDROID)
++  # Android file picking is handled by the SAF bridge in the game code, so NFD
++  # only needs a stub here.
++  list(APPEND SOURCE_FILES nfd_android.cpp)
++endif()
++
+ if(nfd_PLATFORM STREQUAL PLATFORM_MACOS)
+   # For setting the filter list, macOS introduced allowedContentTypes in version 11.0 and deprecated allowedFileTypes in 12.0.
+   # By default (set to ON), NFDe will use allowedContentTypes when targeting macOS >= 11.0.
+diff --git a/src/nfd_android.cpp b/src/nfd_android.cpp
+new file mode 100644
+index 0000000..11a94ee
+--- /dev/null
++++ b/src/nfd_android.cpp
+@@ -0,0 +1,129 @@
++// Stub implementation of the NFD (Native File Dialog) API for Android.
++// The actual file picking on Android goes through the Storage Access Framework
++// bridge (sk2_android.cpp), so NFD itself only ever reports an error here.
++// NFD_OpenDialog* should never be reached on Android: the recompui/game file
++// dialog helpers redirect to the SAF bridge first.
++#include "nfd.h"
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++static const char kAndroidError[] = "Native file dialogs are not supported on Android";
++
++NFD_API nfdresult_t NFD_Init(void) {
++    return NFD_ERROR;
++}
++
++NFD_API void NFD_Quit(void) {
++}
++
++NFD_API nfdresult_t NFD_OpenDialogN(nfdnchar_t** outPath,
++                                    const nfdnfilteritem_t* filterList,
++                                    nfdfiltersize_t filterCount,
++                                    const nfdnchar_t* defaultPath) {
++    return NFD_ERROR;
++}
++
++NFD_API nfdresult_t NFD_OpenDialogU8(nfdu8char_t** outPath,
++                                     const nfdu8filteritem_t* filterList,
++                                     nfdfiltersize_t filterCount,
++                                     const nfdu8char_t* defaultPath) {
++    return NFD_ERROR;
++}
++
++NFD_API nfdresult_t NFD_OpenDialogMultipleN(const nfdpathset_t** outPaths,
++                                            const nfdnfilteritem_t* filterList,
++                                            nfdfiltersize_t filterCount,
++                                            const nfdnchar_t* defaultPath) {
++    return NFD_ERROR;
++}
++
++NFD_API nfdresult_t NFD_OpenDialogMultipleU8(const nfdpathset_t** outPaths,
++                                             const nfdu8filteritem_t* filterList,
++                                             nfdfiltersize_t filterCount,
++                                             const nfdu8char_t* defaultPath) {
++    return NFD_ERROR;
++}
++
++NFD_API nfdresult_t NFD_SaveDialogN(nfdnchar_t** outPath,
++                                    const nfdnfilteritem_t* filterList,
++                                    nfdfiltersize_t filterCount,
++                                    const nfdnchar_t* defaultPath,
++                                    const nfdnchar_t* defaultName) {
++    return NFD_ERROR;
++}
++
++NFD_API nfdresult_t NFD_SaveDialogU8(nfdu8char_t** outPath,
++                                     const nfdu8filteritem_t* filterList,
++                                     nfdfiltersize_t filterCount,
++                                     const nfdu8char_t* defaultPath,
++                                     const nfdu8char_t* defaultName) {
++    return NFD_ERROR;
++}
++
++NFD_API nfdresult_t NFD_PickFolderN(nfdnchar_t** outPath, const nfdnchar_t* defaultPath) {
++    return NFD_ERROR;
++}
++
++NFD_API nfdresult_t NFD_PickFolderU8(nfdu8char_t** outPath, const nfdu8char_t* defaultPath) {
++    return NFD_ERROR;
++}
++
++NFD_API const char* NFD_GetError(void) {
++    return kAndroidError;
++}
++
++NFD_API void NFD_ClearError(void) {
++}
++
++NFD_API void NFD_FreePathN(nfdnchar_t* filePath) {
++}
++
++NFD_API void NFD_FreePathU8(nfdu8char_t* filePath) {
++}
++
++NFD_API nfdresult_t NFD_PathSet_GetCount(const nfdpathset_t* pathSet, nfdpathsetsize_t* count) {
++    return NFD_ERROR;
++}
++
++NFD_API nfdresult_t NFD_PathSet_GetPathN(const nfdpathset_t* pathSet,
++                                         nfdpathsetsize_t index,
++                                         nfdnchar_t** outPath) {
++    return NFD_ERROR;
++}
++
++NFD_API nfdresult_t NFD_PathSet_GetPathU8(const nfdpathset_t* pathSet,
++                                          nfdpathsetsize_t index,
++                                          nfdu8char_t** outPath) {
++    return NFD_ERROR;
++}
++
++NFD_API void NFD_PathSet_FreePathN(const nfdnchar_t* filePath) {
++}
++
++NFD_API void NFD_PathSet_FreePathU8(const nfdu8char_t* filePath) {
++}
++
++NFD_API nfdresult_t NFD_PathSet_GetEnum(const nfdpathset_t* pathSet,
++                                        nfdpathsetenum_t* outEnumerator) {
++    return NFD_ERROR;
++}
++
++NFD_API void NFD_PathSet_FreeEnum(nfdpathsetenum_t* enumerator) {
++}
++
++NFD_API nfdresult_t NFD_PathSet_EnumNextN(nfdpathsetenum_t* enumerator, nfdnchar_t** outPath) {
++    return NFD_ERROR;
++}
++
++NFD_API nfdresult_t NFD_PathSet_EnumNextU8(nfdpathsetenum_t* enumerator, nfdu8char_t** outPath) {
++    return NFD_ERROR;
++}
++
++NFD_API void NFD_PathSet_Free(const nfdpathset_t* pathSet) {
++}
++
++#ifdef __cplusplus
++}
++#endif

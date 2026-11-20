@@ -11,7 +11,7 @@
 #ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
 #include <Windows.h>
-#else
+#elif !defined(__ANDROID__)
 #include <spawn.h>
 #ifdef __APPLE__
 #include <mach-o/dyld.h>
@@ -44,6 +44,10 @@ bool relaunch_game(const std::u8string& game_id) {
     }
     CloseHandle(process.hThread);
     CloseHandle(process.hProcess);
+#elif defined(__ANDROID__)
+    // An Android app cannot respawn its own process; switching regions needs an app restart.
+    (void) resume;
+    return false;
 #else
     auto child_arguments = arguments;
     child_arguments.push_back(resume);
