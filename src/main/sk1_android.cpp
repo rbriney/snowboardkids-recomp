@@ -49,7 +49,7 @@ namespace sk1android {
         g_external_root = external_root;
         setenv("APP_FOLDER_PATH", external_root.string().c_str(), 1);
         // Renderer diagnostics: create these marker files in the external folder to enable.
-        for (const char* flag : { "RT64_UBERSHADERS_ONLY", "RT64_UBERSHADERS_VISIBLE" }) {
+        for (const char* flag : { "RT64_UBERSHADERS_ONLY", "RT64_UBERSHADERS_VISIBLE", "RT64_DISABLE_RAW_TMEM" }) {
             if (std::filesystem::exists(external_root / flag)) {
                 setenv(flag, "1", 1);
                 __android_log_print(ANDROID_LOG_INFO, "SK1", "diagnostic flag %s enabled", flag);

@@ -56,7 +56,7 @@ index 9dcfedf..892fc4b 100644
      struct RenderWindow {
          Display* display;
 diff --git a/plume_vulkan.cpp b/plume_vulkan.cpp
-index f1dd503..e1d5883 100644
+index f1dd503..b7d87e1 100644
 --- a/plume_vulkan.cpp
 +++ b/plume_vulkan.cpp
 @@ -15,6 +15,34 @@
@@ -469,7 +469,25 @@ index f1dd503..e1d5883 100644
          vkCmdBindDescriptorSets(vk, bindPoint, pipelineLayout->vk, setIndex, 1, &interfaceSet->vk, 0, nullptr);
      }
  
-@@ -3901,6 +4097,20 @@ namespace plume {
+@@ -3601,11 +3797,15 @@ namespace plume {
+         submitInfo.pCommandBuffers = commandBuffers.data();
+         submitInfo.commandBufferCount = uint32_t(commandBuffers.size());
+ 
+-        const VkPipelineStageFlags waitStages = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
++        // The wait must cover every stage: waiting only at COLOR_ATTACHMENT_OUTPUT let compute work (e.g. RT64's texture
++        // decode after a copy-queue upload) start before the semaphore signalled, which garbled textures on Mali.
++        // pWaitDstStageMask also needs one entry per wait semaphore.
++        thread_local std::vector<VkPipelineStageFlags> waitStages;
+         if (!waitSemaphoreVector.empty()) {
++            waitStages.assign(waitSemaphoreVector.size(), VK_PIPELINE_STAGE_ALL_COMMANDS_BIT);
+             submitInfo.pWaitSemaphores = waitSemaphoreVector.data();
+             submitInfo.waitSemaphoreCount = uint32_t(waitSemaphoreVector.size());
+-            submitInfo.pWaitDstStageMask = &waitStages;
++            submitInfo.pWaitDstStageMask = waitStages.data();
+         }
+ 
+         if (!signalSemaphoreVector.empty()) {
+@@ -3901,6 +4101,20 @@ namespace plume {
          deviceFeatures.pNext = featuresChain;
          vkGetPhysicalDeviceFeatures2(physicalDevice, &deviceFeatures);
  
@@ -490,7 +508,7 @@ index f1dd503..e1d5883 100644
          // Check for properties.
          if (rayTracingFound) {
              rtPipelineProperties.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_TRACING_PIPELINE_PROPERTIES_KHR;
-@@ -4469,6 +4679,15 @@ namespace plume {
+@@ -4469,6 +4683,15 @@ namespace plume {
              fprintf(stderr, "volkInitialize failed with error code 0x%X.\n", res);
              return;
          }

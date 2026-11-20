@@ -186,6 +186,30 @@ index bde2f03..4b7ecdd 100644
          std::unique_ptr<FramebufferRenderer> framebufferRenderer;
          std::unique_ptr<RenderFramebufferManager> renderFramebufferManager;
          TileProcessor tileProcessor;
+diff --git a/src/render/rt64_framebuffer_renderer.cpp b/src/render/rt64_framebuffer_renderer.cpp
+index 31338ef..b96f7d5 100644
+--- a/src/render/rt64_framebuffer_renderer.cpp
++++ b/src/render/rt64_framebuffer_renderer.cpp
+@@ -4,6 +4,8 @@
+ 
+ #include "rt64_framebuffer_renderer.h"
+ 
++#include <cstdlib>
++
+ #include "../include/rt64_extended_gbi.h"
+ 
+ #include "common/rt64_elapsed_timer.h"
+@@ -269,7 +271,9 @@ namespace RT64 {
+                 gpuTile.flags.alphaIsCvg = false;
+                 gpuTile.flags.highRes = textureReplaced;
+                 gpuTile.flags.fromCopy = false;
+-                gpuTile.flags.rawTMEM = !textureReplaced && callTile.rawTMEM;
++                // Diagnostics: RT64_DISABLE_RAW_TMEM samples the decoded texture instead of decoding TMEM in the shader.
++                static const bool rawTMEMDisabled = (std::getenv("RT64_DISABLE_RAW_TMEM") != nullptr);
++                gpuTile.flags.rawTMEM = !textureReplaced && callTile.rawTMEM && !rawTMEMDisabled;
+                 gpuTile.flags.hasMipmaps = hasMipmaps;
+                 gpuTile.flags.shiftedByHalf = shiftedByHalf;
+             }
 diff --git a/src/render/rt64_shader_library.cpp b/src/render/rt64_shader_library.cpp
 index d1c5273..e4622b7 100644
 --- a/src/render/rt64_shader_library.cpp
