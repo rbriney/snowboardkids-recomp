@@ -1,13 +1,25 @@
-// Two-player lockstep netplay over UDP. See netplay.h for configuration.
+// Lockstep netplay over UDP for up to four players. See netplay.h for configuration.
 //
-// Every machine runs the full game. At the start of game tick t each machine samples its local controller (the
-// game's port 0 on that machine) and schedules it for tick t + delay, then sends all inputs the peer has not yet
-// acknowledged. Tick t only runs once the peer's input for tick t has arrived, so both machines feed identical inputs
-// to identical game code (see the determinism harness results). Each packet repeats every unacknowledged input, so a
-// lost packet needs no retransmission logic. Packets also carry a recent game-state hash for desync detection.
+// Every machine runs the full game. The game's four controller ports are shared out between the machines in the
+// session: the host takes the first ports (one per local player), and each joining machine takes the next ones in
+// join order. At the start of game tick t each machine samples its local controllers and schedules them for tick
+// t + delay. Tick t only runs once every port's input for tick t is known, so all machines feed identical inputs to
+// identical game code (see the determinism harness results).
 //
-// Handshake: the joiner sends HELLO (with a bitmask of save chunks it already has) until the host has sent WELCOME
-// and all 32 save chunks; it then sends READY until it sees START or the host's first INPUT packet.
+// Topology is a star: joiners talk only to the host, which relays each port's inputs to everyone else as they
+// arrive. Each packet repeats every input the receiver has not acknowledged, so a lost packet needs no retransmission
+// logic. Packets also carry a recent game-state hash for desync detection.
+//
+// Pauses: when the host has been waiting more than a moment for a joiner's input (or the joiner has gone quiet), it
+// pauses the session. Every host packet carries the pause state, the players' statuses and who has pressed A, and the
+// status overlay shows them on every machine. Play resumes once every connected player has pressed A. A joiner that
+// disconnects can come back (from the same address) and catch up; the host can instead press Start to continue
+// without it, in which case the host supplies neutral input for its ports from the first tick it has not yet relayed.
+// Everyone still receives the same inputs, so nobody desyncs. Pausing only holds ticks; it never changes game state.
+//
+// Handshake: a joiner sends HELLO (its local player count and the save chunks it already has) until the host has sent
+// WELCOME (its ports) and all 32 save chunks, then READY. Once every expected port is taken and every joiner is ready,
+// the host sends START (the port owners) and play begins.
 
 #include <algorithm>
 #include <array>
@@ -16,9 +28,9 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <deque>
 #include <filesystem>
 #include <fstream>
-#include <deque>
 #include <mutex>
 #include <random>
 #include <string>
@@ -52,54 +64,72 @@
 #endif
 
 #include "recomp.h"
+#include "recompinput/players.h"
 #include "ultramodern/ultramodern.hpp"
 #include "netplay.h"
 #include "determinism_harness.h"
+#include "netplay_overlay.h"
+#include "recompinput/profiles.h"
+
+// RT64 (rt64.patch): keep presenting while the game is held, so the status overlay is drawn.
+extern "C" void rt64_set_force_present(int enable);
 
 namespace {
 
 #ifdef _WIN32
 using socket_t = SOCKET;
 constexpr socket_t invalid_socket = INVALID_SOCKET;
-void close_socket(socket_t s) { closesocket(s); }
 #else
 using socket_t = int;
 constexpr socket_t invalid_socket = -1;
-void close_socket(socket_t s) { close(s); }
 #endif
 
 using clock_type = std::chrono::steady_clock;
 
 constexpr uint32_t packet_magic = 0x4E314B53; // "SK1N"
-constexpr uint16_t protocol_version = 1;
+constexpr uint16_t protocol_version = 3;
 constexpr uint32_t save_size = 0x8000;
 constexpr uint32_t chunk_size = 1024;
 constexpr uint32_t chunk_count = save_size / chunk_size;
 constexpr uint32_t all_chunks = 0xFFFFFFFFu;
 constexpr uint32_t port_count = 4;
-constexpr uint32_t max_inputs_per_packet = 64;
+constexpr uint32_t max_clients = 3;
+constexpr uint32_t max_inputs_per_block = 48;
 constexpr uint32_t hash_history = 512;
 constexpr uint32_t no_tick = 0xFFFFFFFFu;
-constexpr auto peer_timeout = std::chrono::seconds(10);
+constexpr uint8_t host_id = 0;
+constexpr uint8_t unassigned_id = 0xFF;
+constexpr uint8_t no_owner = 0xFF;
+constexpr auto peer_timeout = std::chrono::seconds(10);      // a joiner without the host gives up after this
+constexpr auto pause_after = std::chrono::milliseconds(1500); // host pauses after waiting this long for a joiner
+constexpr auto disconnected_after = std::chrono::seconds(4);  // a silent joiner is shown as disconnected
+constexpr auto scripted_drop_after = std::chrono::seconds(3); // unattended tests: drop a disconnected joiner
 constexpr auto resend_interval = std::chrono::milliseconds(15);
 constexpr auto hello_interval = std::chrono::milliseconds(200);
+constexpr uint32_t stats_interval = 900; // 30 seconds of game time
 static_assert(chunk_count == 32);
 
-enum PacketType : uint8_t { Hello = 1, Welcome = 2, SaveChunk = 3, Ready = 4, Start = 5, Input = 6 };
+enum PacketType : uint8_t { Hello = 1, Welcome = 2, SaveChunk = 3, Ready = 4, Start = 5, Input = 6, Full = 7 };
 
 #pragma pack(push, 1)
 struct Header {
     uint32_t magic;
     uint16_t version;
     uint8_t type;
-    uint8_t player;
+    uint8_t sender; // host_id, a joiner's id (1-3), or unassigned_id before WELCOME
 };
 struct HelloPacket {
     Header header;
+    uint8_t local_players;
+    uint8_t padding[3];
     uint32_t have_mask;
 };
 struct WelcomePacket {
     Header header;
+    uint8_t client_id;
+    uint8_t first_port;
+    uint8_t local_players;
+    uint8_t total_ports;
     uint8_t delay;
     uint8_t padding[3];
 };
@@ -109,24 +139,77 @@ struct SaveChunkPacket {
     uint8_t padding[3];
     uint8_t data[chunk_size];
 };
+struct StartPacket {
+    Header header;
+    uint8_t total_ports;
+    uint8_t owners[port_count];
+    uint8_t padding[3];
+};
 struct WireInput {
     uint16_t buttons;
     int8_t stick_x;
     int8_t stick_y;
 };
-struct InputPacket {
-    Header header;
-    uint32_t first_tick; // tick of inputs[0]
-    uint32_t ack_tick;   // the sender holds every one of the receiver's inputs below this tick
-    uint32_t hash_tick;  // tick of state_hash, or no_tick
-    uint32_t state_hash;
+struct InputBlockHeader {
+    uint8_t port;
     uint8_t count;
-    uint8_t padding[3];
-    WireInput inputs[max_inputs_per_packet];
+    uint8_t padding[2];
+    uint32_t first_tick;
+};
+struct InputPacketHeader {
+    Header header;
+    uint32_t sequence;         // per sender, increasing; older pause states are ignored
+    uint32_t acks[port_count]; // the sender holds every input below acks[p] for port p
+    uint32_t hash_tick;        // tick of state_hash, or no_tick
+    uint32_t state_hash;
+    uint8_t pause_id;          // host: current pause number; joiner: the pause its ready bits answer
+    uint8_t paused;            // host only
+    uint8_t ready_mask;        // ports whose player has pressed A during pause pause_id
+    uint8_t port_states[port_count]; // host only: sk1net::PlayerState per port
+    uint8_t block_count;
+    // followed by block_count x (InputBlockHeader + count x WireInput)
 };
 #pragma pack(pop)
 
-constexpr size_t input_packet_base = sizeof(InputPacket) - sizeof(WireInput) * max_inputs_per_packet;
+constexpr size_t max_packet_size =
+    sizeof(InputPacketHeader) + port_count * (sizeof(InputBlockHeader) + max_inputs_per_block * sizeof(WireInput));
+static_assert(max_packet_size < 1400, "input packets must fit in one UDP datagram");
+
+struct PortStream {
+    std::vector<WireInput> inputs; // indexed by tick
+    std::vector<uint8_t> have;
+    uint32_t next = 0; // every input below this tick is known
+
+    void ensure(uint32_t t) {
+        if (t >= inputs.size()) {
+            inputs.resize(t + 1024);
+            have.resize(t + 1024, 0);
+        }
+    }
+    void set(uint32_t t, WireInput in) {
+        ensure(t);
+        if (!have[t]) {
+            inputs[t] = in;
+            have[t] = 1;
+        }
+        while (next < have.size() && have[next]) {
+            next++;
+        }
+    }
+    WireInput get(uint32_t t) const { return t < inputs.size() ? inputs[t] : WireInput{}; }
+};
+
+struct Client {
+    bool used = false;
+    sockaddr_in address{};
+    uint8_t first_port = 0;
+    uint8_t local_players = 1;
+    bool ready = false;
+    bool dropped = false;
+    clock_type::time_point last_receive{};
+    std::array<uint32_t, port_count> acks{}; // the joiner holds every input below acks[p]
+    uint32_t last_sequence = 0;
+};
 
 struct Session {
     bool initialised = false;
@@ -134,31 +217,32 @@ struct Session {
     bool started = false;
     bool ended = false;
     bool is_host = false;
-    uint8_t my_player = 0;
-    uint8_t peer_player = 1;
+    uint8_t my_id = unassigned_id;
+    uint8_t local_players = 1;
+    uint8_t first_port = 0;
+    uint8_t total_ports = 2;
     uint32_t delay = 3;
+    std::array<uint8_t, port_count> owners{ no_owner, no_owner, no_owner, no_owner };
 
     socket_t sock = invalid_socket;
-    sockaddr_in peer{};
-    bool have_peer = false;
-    clock_type::time_point last_receive{};
+    sockaddr_in host_address{};
+    clock_type::time_point last_host_receive{};
+    std::array<uint32_t, port_count> host_acks{}; // joiner: the host holds every input below host_acks[p]
+    std::array<Client, max_clients> clients{};
+    uint8_t next_free_port = 0;
 
     std::mutex save_mutex;
     std::vector<uint8_t> save;
     uint32_t have_mask = 0;
     bool welcomed = false;
 
-    std::vector<WireInput> local;  // indexed by tick
-    std::vector<WireInput> remote; // indexed by tick
-    std::vector<uint8_t> remote_have;
-    uint32_t remote_next = 0; // every remote input below this tick has arrived
-    uint32_t peer_ack = 0;    // the peer holds every local input below this tick
+    std::array<PortStream, port_count> ports{};
     uint32_t tick = 0;
 
     std::array<uint32_t, hash_history> my_hash_tick{};
     std::array<uint32_t, hash_history> my_hash{};
-    std::array<uint32_t, hash_history> peer_hash_tick{};
-    std::array<uint32_t, hash_history> peer_hash{};
+    std::array<std::array<uint32_t, hash_history>, max_clients + 1> peer_hash_tick{};
+    std::array<std::array<uint32_t, hash_history>, max_clients + 1> peer_hash{};
     uint32_t last_hash_tick = no_tick;
     bool desync_reported = false;
 
@@ -172,9 +256,22 @@ struct Session {
     std::mt19937 sim_rng{ 12345 };
     struct DelayedPacket {
         clock_type::time_point due;
+        sockaddr_in to;
         std::vector<uint8_t> data;
     };
     std::deque<DelayedPacket> sim_queue;
+
+    // Pause state. The host owns it; joiners copy it from the host's packets.
+    bool paused = false;
+    uint8_t pause_id = 0;
+    uint8_t ready_mask = 0; // ports ready during the current pause
+    std::array<sk1net::PlayerState, port_count> port_states{};
+    std::array<bool, port_count> a_was_down{};
+    uint32_t sequence = 0;
+    uint32_t host_last_sequence = 0;
+    bool waiting_for_host = false; // joiner: shown when the host has been quiet a while
+    std::mutex status_mutex;
+    sk1net::OverlayStatus status;
 
     // Statistics, logged every stats_interval ticks.
     std::chrono::microseconds stall_total{ 0 };
@@ -183,8 +280,6 @@ struct Session {
     uint64_t packets_sent = 0;
     uint64_t packets_received = 0;
 } session;
-
-constexpr uint32_t stats_interval = 900; // 30 seconds of game time
 
 void log_msg(const char* fmt, ...) {
     char buffer[512];
@@ -203,6 +298,8 @@ void log_msg(const char* fmt, ...) {
     }
 }
 
+// Player-facing notice: a message box on its own thread so the game never waits on it. Suppressed for scripted
+// (unattended) runs, where nobody could dismiss it.
 void notify_player(const std::string& message) {
     if (session.scripted) {
         return;
@@ -212,16 +309,26 @@ void notify_player(const std::string& message) {
     }).detach();
 }
 
+std::string address_text(const sockaddr_in& a) {
+    char text[64];
+    inet_ntop(AF_INET, &a.sin_addr, text, sizeof(text));
+    return std::string(text) + ":" + std::to_string(ntohs(a.sin_port));
+}
+
+bool same_address(const sockaddr_in& a, const sockaddr_in& b) {
+    return a.sin_addr.s_addr == b.sin_addr.s_addr && a.sin_port == b.sin_port;
+}
+
 void fill_header(Header& h, PacketType type) {
     h.magic = packet_magic;
     h.version = protocol_version;
     h.type = type;
-    h.player = session.my_player;
+    h.sender = session.my_id;
 }
 
-void send_now(const void* data, size_t size) {
+void send_now(const sockaddr_in& to, const void* data, size_t size) {
     sendto(session.sock, reinterpret_cast<const char*>(data), static_cast<int>(size), 0,
-        reinterpret_cast<const sockaddr*>(&session.peer), sizeof(session.peer));
+        reinterpret_cast<const sockaddr*>(&to), sizeof(to));
     session.packets_sent++;
 }
 
@@ -229,15 +336,13 @@ void send_now(const void* data, size_t size) {
 void flush_delayed() {
     const auto now = clock_type::now();
     while (!session.sim_queue.empty() && session.sim_queue.front().due <= now) {
-        send_now(session.sim_queue.front().data.data(), session.sim_queue.front().data.size());
+        const auto& p = session.sim_queue.front();
+        send_now(p.to, p.data.data(), p.data.size());
         session.sim_queue.pop_front();
     }
 }
 
-void send_raw(const void* data, size_t size) {
-    if (!session.have_peer) {
-        return;
-    }
+void send_to(const sockaddr_in& to, const void* data, size_t size) {
     if (session.sim_loss_percent != 0 && (session.sim_rng() % 100) < session.sim_loss_percent) {
         return;
     }
@@ -247,7 +352,7 @@ void send_raw(const void* data, size_t size) {
             delay_ms += session.sim_rng() % (session.sim_jitter_ms + 1);
         }
         const uint8_t* bytes = static_cast<const uint8_t*>(data);
-        Session::DelayedPacket packet{ clock_type::now() + std::chrono::milliseconds(delay_ms),
+        Session::DelayedPacket packet{ clock_type::now() + std::chrono::milliseconds(delay_ms), to,
             std::vector<uint8_t>(bytes, bytes + size) };
         // Keep the queue ordered by due time (jitter can reorder packets, as a real network can).
         auto it = session.sim_queue.end();
@@ -258,81 +363,188 @@ void send_raw(const void* data, size_t size) {
         flush_delayed();
         return;
     }
-    send_now(data, size);
+    send_now(to, data, size);
 }
 
-WireInput input_at(const std::vector<WireInput>& inputs, uint32_t t) {
-    if (t < session.delay || t >= inputs.size()) {
-        return WireInput{};
+bool owns_port(uint8_t id, uint32_t port) {
+    return port < port_count && session.owners[port] == id;
+}
+
+bool is_local_port(uint32_t port) {
+    return port >= session.first_port && port < uint32_t(session.first_port) + session.local_players;
+}
+
+// Builds and sends one INPUT packet: every port in send_ports, from the receiver's acknowledgement onwards.
+void send_input_packet(const sockaddr_in& to, const std::array<uint32_t, port_count>& receiver_acks,
+    const std::array<bool, port_count>& send_ports) {
+    uint8_t buffer[max_packet_size];
+    InputPacketHeader header{};
+    fill_header(header.header, Input);
+    header.sequence = ++session.sequence;
+    for (uint32_t p = 0; p < port_count; p++) {
+        header.acks[p] = session.ports[p].next;
+        header.port_states[p] = static_cast<uint8_t>(session.port_states[p]);
     }
-    return inputs[t];
+    header.pause_id = session.pause_id;
+    header.paused = session.paused ? 1 : 0;
+    header.ready_mask = session.ready_mask;
+    header.hash_tick = session.last_hash_tick;
+    header.state_hash =
+        session.last_hash_tick == no_tick ? 0 : session.my_hash[session.last_hash_tick % hash_history];
+    size_t offset = sizeof(InputPacketHeader);
+    for (uint32_t p = 0; p < session.total_ports; p++) {
+        if (!send_ports[p]) {
+            continue;
+        }
+        const uint32_t first = std::max(receiver_acks[p], session.delay);
+        const uint32_t end = session.ports[p].next; // exclusive
+        if (end <= first) {
+            continue;
+        }
+        const uint32_t count = std::min(end - first, max_inputs_per_block);
+        InputBlockHeader block{};
+        block.port = static_cast<uint8_t>(p);
+        block.count = static_cast<uint8_t>(count);
+        block.first_tick = first;
+        std::memcpy(buffer + offset, &block, sizeof(block));
+        offset += sizeof(block);
+        for (uint32_t i = 0; i < count; i++) {
+            const WireInput in = session.ports[p].get(first + i);
+            std::memcpy(buffer + offset, &in, sizeof(in));
+            offset += sizeof(in);
+        }
+        header.block_count++;
+    }
+    std::memcpy(buffer, &header, sizeof(header));
+    send_to(to, buffer, offset);
 }
 
 void send_inputs() {
-    InputPacket p{};
-    fill_header(p.header, Input);
-    const uint32_t last = session.tick + session.delay; // newest scheduled local input
-    uint32_t first = std::max(session.peer_ack, session.delay);
-    uint32_t count = 0;
-    if (last >= first) {
-        count = std::min(last - first + 1, max_inputs_per_packet);
+    if (session.is_host) {
+        for (uint8_t c = 0; c < max_clients; c++) {
+            const Client& client = session.clients[c];
+            if (!client.used || client.dropped) {
+                continue;
+            }
+            // Everything the joiner does not supply itself.
+            std::array<bool, port_count> ports{};
+            for (uint32_t p = 0; p < port_count; p++) {
+                ports[p] = !owns_port(uint8_t(c + 1), p);
+            }
+            send_input_packet(client.address, client.acks, ports);
+        }
+    } else {
+        std::array<bool, port_count> ports{};
+        for (uint32_t p = 0; p < port_count; p++) {
+            ports[p] = owns_port(session.my_id, p);
+        }
+        send_input_packet(session.host_address, session.host_acks, ports);
     }
-    p.first_tick = first;
-    p.count = static_cast<uint8_t>(count);
-    for (uint32_t i = 0; i < count; i++) {
-        p.inputs[i] = input_at(session.local, first + i);
-    }
-    p.ack_tick = session.remote_next;
-    p.hash_tick = session.last_hash_tick;
-    p.state_hash = session.last_hash_tick == no_tick ? 0 : session.my_hash[session.last_hash_tick % hash_history];
-    send_raw(&p, input_packet_base + count * sizeof(WireInput));
 }
 
-void check_hash(uint32_t t) {
+void report_desync(uint32_t t, uint8_t peer) {
+    if (session.desync_reported) {
+        return;
+    }
+    session.desync_reported = true;
+    log_msg("DESYNC: game state differs from %s at tick %u", peer == host_id ? "the host's" : "a joiner's", t);
+    notify_player("The games have gone out of sync, so they may no longer show the same race. "
+                  "Restart the games to play again.");
+}
+
+void check_hash(uint32_t t, uint8_t peer) {
     const uint32_t slot = t % hash_history;
-    if (session.my_hash_tick[slot] != t || session.peer_hash_tick[slot] != t) {
+    if (session.my_hash_tick[slot] != t || session.peer_hash_tick[peer][slot] != t) {
         return;
     }
-    if (session.my_hash[slot] != session.peer_hash[slot] && !session.desync_reported) {
-        session.desync_reported = true;
-        log_msg("DESYNC: game state differs from the peer's at tick %u", t);
-        notify_player("The two games have gone out of sync, so they may no longer show the same race. "
-                      "Restart both games to play again.");
+    if (session.my_hash[slot] != session.peer_hash[peer][slot]) {
+        report_desync(t, peer);
     }
 }
 
-void handle_input(const InputPacket& p, size_t size) {
-    if (size < input_packet_base || size < input_packet_base + p.count * sizeof(WireInput)) {
+void handle_input(const uint8_t* data, size_t size, uint8_t sender) {
+    if (size < sizeof(InputPacketHeader)) {
         return;
     }
-    for (uint32_t i = 0; i < p.count; i++) {
-        const uint32_t t = p.first_tick + i;
-        if (t >= session.remote.size()) {
-            session.remote.resize(t + 1024);
-            session.remote_have.resize(t + 1024, 0);
+    InputPacketHeader header;
+    std::memcpy(&header, data, sizeof(header));
+    size_t offset = sizeof(header);
+    for (uint32_t b = 0; b < header.block_count; b++) {
+        if (offset + sizeof(InputBlockHeader) > size) {
+            return;
         }
-        if (!session.remote_have[t]) {
-            session.remote[t] = p.inputs[i];
-            session.remote_have[t] = 1;
+        InputBlockHeader block;
+        std::memcpy(&block, data + offset, sizeof(block));
+        offset += sizeof(block);
+        if (offset + block.count * sizeof(WireInput) > size || block.port >= port_count) {
+            return;
+        }
+        // Accept a port's input only from the machine entitled to send it: its owner, or the host relaying it.
+        const bool allowed = !is_local_port(block.port) &&
+            (session.is_host ? owns_port(sender, block.port) : sender == host_id);
+        for (uint32_t i = 0; i < block.count; i++) {
+            WireInput in;
+            std::memcpy(&in, data + offset, sizeof(in));
+            offset += sizeof(in);
+            if (allowed) {
+                session.ports[block.port].set(block.first_tick + i, in);
+            }
         }
     }
-    while (session.remote_next < session.remote_have.size() && session.remote_have[session.remote_next]) {
-        session.remote_next++;
+    if (session.is_host) {
+        if (sender >= 1 && sender <= max_clients) {
+            Client& client = session.clients[sender - 1];
+            for (uint32_t p = 0; p < port_count; p++) {
+                client.acks[p] = std::max(client.acks[p], header.acks[p]);
+            }
+            // A joiner's A presses count only for the pause they answer, and only for its own ports.
+            if (session.paused && header.pause_id == session.pause_id) {
+                for (uint32_t p = 0; p < port_count; p++) {
+                    if ((header.ready_mask & (1u << p)) && owns_port(sender, p)) {
+                        session.ready_mask |= uint8_t(1u << p);
+                    }
+                }
+            }
+        }
+    } else {
+        for (uint32_t p = 0; p < port_count; p++) {
+            session.host_acks[p] = std::max(session.host_acks[p], header.acks[p]);
+        }
+        if (header.sequence > session.host_last_sequence) {
+            session.host_last_sequence = header.sequence;
+            if (header.pause_id != session.pause_id) {
+                // A new pause: our own A presses must be fresh.
+                session.ready_mask = 0;
+                session.a_was_down.fill(true);
+            }
+            session.pause_id = header.pause_id;
+            session.paused = header.paused != 0;
+            // Others' ready bits come from the host; keep our own until the host has them.
+            const uint8_t local_mask = uint8_t(((1u << session.local_players) - 1) << session.first_port);
+            session.ready_mask = uint8_t((header.ready_mask & ~local_mask) | (session.ready_mask & local_mask));
+            for (uint32_t p = 0; p < port_count; p++) {
+                session.port_states[p] = static_cast<sk1net::PlayerState>(header.port_states[p] & 3);
+            }
+        }
     }
-    session.peer_ack = std::max(session.peer_ack, p.ack_tick);
-    if (p.hash_tick != no_tick) {
-        const uint32_t slot = p.hash_tick % hash_history;
-        session.peer_hash_tick[slot] = p.hash_tick;
-        session.peer_hash[slot] = p.state_hash;
-        check_hash(p.hash_tick);
+    if (header.hash_tick != no_tick && sender <= max_clients) {
+        const uint32_t slot = header.hash_tick % hash_history;
+        session.peer_hash_tick[sender][slot] = header.hash_tick;
+        session.peer_hash[sender][slot] = header.state_hash;
+        check_hash(header.hash_tick, sender);
     }
 }
 
-void send_save_chunks(uint32_t have_mask) {
+void send_welcome(uint8_t client_index, uint32_t have_mask) {
+    const Client& client = session.clients[client_index];
     WelcomePacket w{};
     fill_header(w.header, Welcome);
+    w.client_id = uint8_t(client_index + 1);
+    w.first_port = client.first_port;
+    w.local_players = client.local_players;
+    w.total_ports = session.total_ports;
     w.delay = static_cast<uint8_t>(session.delay);
-    send_raw(&w, sizeof(w));
+    send_to(client.address, &w, sizeof(w));
     for (uint32_t i = 0; i < chunk_count; i++) {
         if (have_mask & (1u << i)) {
             continue;
@@ -341,61 +553,126 @@ void send_save_chunks(uint32_t have_mask) {
         fill_header(c.header, SaveChunk);
         c.index = static_cast<uint8_t>(i);
         std::memcpy(c.data, session.save.data() + i * chunk_size, chunk_size);
-        send_raw(&c, sizeof(c));
+        send_to(client.address, &c, sizeof(c));
     }
 }
 
-void process_packet(const uint8_t* data, size_t size, const sockaddr_in& from) {
-    if (size < sizeof(Header)) {
-        return;
+void send_start(const sockaddr_in& to) {
+    StartPacket s{};
+    fill_header(s.header, Start);
+    s.total_ports = session.total_ports;
+    std::memcpy(s.owners, session.owners.data(), port_count);
+    send_to(to, &s, sizeof(s));
+}
+
+void start_session() {
+    session.started = true;
+    sk1net_overlay::install();
+    std::string layout;
+    for (uint32_t p = 0; p < session.total_ports; p++) {
+        layout += " P" + std::to_string(p + 1) + "=" +
+            (session.owners[p] == host_id ? std::string("host") : "joiner " + std::to_string(session.owners[p]));
     }
-    Header h;
-    std::memcpy(&h, data, sizeof(h));
-    if (h.magic != packet_magic || h.version != protocol_version || h.player != session.peer_player) {
-        return;
+    log_msg("session started: %u players, input delay %u ticks;%s", session.total_ports, session.delay,
+        layout.c_str());
+    // Several players on this machine need their controllers assigned to its ports.
+    if (session.local_players > 1) {
+        recompinput::players::request_game_player_count(session.local_players);
     }
-    if (session.is_host) {
-        if (!session.have_peer) {
-            session.peer = from;
-            session.have_peer = true;
-            char address[64];
-            inet_ntop(AF_INET, &from.sin_addr, address, sizeof(address));
-            log_msg("player 2 connected from %s:%u", address, ntohs(from.sin_port));
-        } else if (from.sin_addr.s_addr != session.peer.sin_addr.s_addr || from.sin_port != session.peer.sin_port) {
-            return;
+}
+
+void host_process(const uint8_t* data, size_t size, const Header& h, const sockaddr_in& from) {
+    // Find the joiner by address.
+    int index = -1;
+    for (uint8_t c = 0; c < max_clients; c++) {
+        if (session.clients[c].used && same_address(session.clients[c].address, from)) {
+            index = c;
+            break;
         }
     }
-    session.last_receive = clock_type::now();
-
-    switch (h.type) {
-        case Hello:
-            if (session.is_host && size >= sizeof(HelloPacket)) {
-                HelloPacket p;
-                std::memcpy(&p, data, sizeof(p));
-                send_save_chunks(p.have_mask);
-            }
-            break;
-        case Ready:
-            if (session.is_host) {
-                if (!session.started) {
-                    session.started = true;
-                    log_msg("session started (input delay %u ticks)", session.delay);
+    if (h.type == Hello && size >= sizeof(HelloPacket)) {
+        HelloPacket p;
+        std::memcpy(&p, data, sizeof(p));
+        if (index < 0) {
+            const uint8_t wanted = std::clamp<uint8_t>(p.local_players, 1, port_count);
+            int free_slot = -1;
+            for (uint8_t c = 0; c < max_clients; c++) {
+                if (!session.clients[c].used) {
+                    free_slot = c;
+                    break;
                 }
-                Header s;
-                fill_header(s, Start);
-                send_raw(&s, sizeof(s));
+            }
+            if (session.started || free_slot < 0 || session.next_free_port + wanted > session.total_ports) {
+                Header full;
+                fill_header(full, Full);
+                send_to(from, &full, sizeof(full));
+                return;
+            }
+            Client& client = session.clients[free_slot];
+            client = Client{};
+            client.used = true;
+            client.address = from;
+            client.first_port = session.next_free_port;
+            client.local_players = wanted;
+            for (uint32_t i = 0; i < wanted; i++) {
+                session.owners[client.first_port + i] = uint8_t(free_slot + 1);
+            }
+            session.next_free_port += wanted;
+            index = free_slot;
+            log_msg("joiner %d connected from %s with %u player(s): ports %u-%u", index + 1,
+                address_text(from).c_str(), wanted, client.first_port + 1, client.first_port + wanted);
+        }
+        session.clients[index].last_receive = clock_type::now();
+        send_welcome(uint8_t(index), p.have_mask);
+        return;
+    }
+    if (index < 0 || h.sender != index + 1) {
+        return;
+    }
+    Client& client = session.clients[index];
+    client.last_receive = clock_type::now();
+    switch (h.type) {
+        case Ready:
+            if (!client.ready) {
+                client.ready = true;
+                log_msg("joiner %d ready", index + 1);
+            }
+            if (session.started) {
+                send_start(client.address);
             }
             break;
+        case Input:
+            if (session.started && !client.dropped) {
+                handle_input(data, size, h.sender);
+            }
+            break;
+    }
+}
+
+void joiner_process(const uint8_t* data, size_t size, const Header& h, const sockaddr_in& from) {
+    if (!same_address(from, session.host_address) || h.sender != host_id) {
+        return;
+    }
+    session.last_host_receive = clock_type::now();
+    switch (h.type) {
         case Welcome:
-            if (!session.is_host && size >= sizeof(WelcomePacket)) {
+            if (size >= sizeof(WelcomePacket)) {
                 WelcomePacket p;
                 std::memcpy(&p, data, sizeof(p));
-                session.delay = p.delay;
-                session.welcomed = true;
+                if (!session.welcomed) {
+                    session.welcomed = true;
+                    session.my_id = p.client_id;
+                    session.first_port = p.first_port;
+                    session.local_players = p.local_players;
+                    session.total_ports = std::clamp<uint8_t>(p.total_ports, 2, port_count);
+                    session.delay = p.delay;
+                    log_msg("welcomed as joiner %u: ports %u-%u of %u, input delay %u", p.client_id,
+                        p.first_port + 1, p.first_port + p.local_players, session.total_ports, session.delay);
+                }
             }
             break;
         case SaveChunk:
-            if (!session.is_host && size >= sizeof(SaveChunkPacket)) {
+            if (size >= sizeof(SaveChunkPacket)) {
                 const SaveChunkPacket* p = reinterpret_cast<const SaveChunkPacket*>(data);
                 if (p->index < chunk_count && !(session.have_mask & (1u << p->index))) {
                     std::lock_guard lock{ session.save_mutex };
@@ -405,22 +682,52 @@ void process_packet(const uint8_t* data, size_t size, const sockaddr_in& from) {
             }
             break;
         case Start:
-            if (!session.is_host && session.welcomed && session.have_mask == all_chunks && !session.started) {
-                session.started = true;
-                log_msg("session started (input delay %u ticks)", session.delay);
+            if (size >= sizeof(StartPacket) && session.welcomed && session.have_mask == all_chunks &&
+                !session.started) {
+                StartPacket p;
+                std::memcpy(&p, data, sizeof(p));
+                session.total_ports = std::clamp<uint8_t>(p.total_ports, 2, port_count);
+                std::memcpy(session.owners.data(), p.owners, port_count);
+                start_session();
             }
             break;
         case Input:
-            if (!session.is_host && !session.started && session.welcomed && session.have_mask == all_chunks) {
-                session.started = true;
-                log_msg("session started (input delay %u ticks)", session.delay);
-            }
             if (session.started) {
-                InputPacket p{};
-                std::memcpy(&p, data, std::min(size, sizeof(p)));
-                handle_input(p, size);
+                handle_input(data, size, h.sender);
             }
             break;
+        case Full:
+            if (!session.welcomed && !session.ended) {
+                session.ended = true;
+                log_msg("the host's session is full or already running");
+                notify_player("Could not join: the host's netplay session is full or has already started.");
+            }
+            break;
+    }
+}
+
+void process_packet(const uint8_t* data, size_t size, const sockaddr_in& from) {
+    if (size < sizeof(Header)) {
+        return;
+    }
+    Header h;
+    std::memcpy(&h, data, sizeof(h));
+    if (h.magic != packet_magic) {
+        return;
+    }
+    if (h.version != protocol_version) {
+        static bool reported = false;
+        if (!reported) {
+            reported = true;
+            log_msg("ignoring packets from %s: different netplay version (%u, this is %u)",
+                address_text(from).c_str(), h.version, protocol_version);
+        }
+        return;
+    }
+    if (session.is_host) {
+        host_process(data, size, h, from);
+    } else {
+        joiner_process(data, size, h, from);
     }
 }
 
@@ -465,12 +772,20 @@ bool set_non_blocking(socket_t s) {
 #endif
 }
 
-void open_log(bool hosting) {
+void open_log(const std::string& name) {
     std::filesystem::path folder = std::filesystem::current_path();
     if (const char* app = std::getenv("APP_FOLDER_PATH"); app != nullptr && *app != '\0') {
         folder = std::filesystem::u8path(app);
     }
-    session.log = std::fopen((folder / (hosting ? "netplay-host.log" : "netplay-join.log")).string().c_str(), "w");
+    session.log = std::fopen((folder / name).string().c_str(), "w");
+}
+
+uint32_t env_uint(const char* name, uint32_t min_value, uint32_t max_value, uint32_t fallback) {
+    const char* value = std::getenv(name);
+    if (value == nullptr || *value == '\0') {
+        return fallback;
+    }
+    return std::clamp<uint32_t>(static_cast<uint32_t>(std::max(std::atoi(value), 0)), min_value, max_value);
 }
 
 void init() {
@@ -486,7 +801,10 @@ void init() {
     if (!hosting && !joining) {
         return;
     }
-    open_log(hosting);
+    // A log per role and instance, so several copies on one machine do not share one.
+    const char* instance = std::getenv("SK1_NET_INSTANCE");
+    open_log(std::string(hosting ? "netplay-host" : "netplay-join") +
+        (instance != nullptr && *instance != '\0' ? std::string("-") + instance : std::string()) + ".log");
 
 #ifdef _WIN32
     WSADATA wsa;
@@ -514,18 +832,21 @@ void init() {
     if (const char* bind_address = std::getenv("SK1_NET_BIND"); bind_address != nullptr && *bind_address != 0) {
         inet_pton(AF_INET, bind_address, &local.sin_addr);
     }
+    session.local_players = static_cast<uint8_t>(env_uint("SK1_NET_LOCAL_PLAYERS", 1, port_count, 1));
     if (hosting) {
         session.is_host = true;
-        session.my_player = 0;
-        session.peer_player = 1;
+        session.my_id = host_id;
+        session.first_port = 0;
         local.sin_port = htons(static_cast<uint16_t>(std::atoi(host)));
-        if (const char* d = std::getenv("SK1_NET_DELAY"); d != nullptr && *d != '\0') {
-            session.delay = static_cast<uint32_t>(std::clamp(std::atoi(d), 1, 30));
+        session.delay = env_uint("SK1_NET_DELAY", 1, 30, 3);
+        const uint32_t minimum = std::min<uint32_t>(session.local_players + 1, port_count);
+        session.total_ports = static_cast<uint8_t>(env_uint("SK1_NET_PLAYERS", minimum, port_count, minimum));
+        for (uint32_t i = 0; i < session.local_players; i++) {
+            session.owners[i] = host_id;
         }
+        session.next_free_port = session.local_players;
     } else {
         session.is_host = false;
-        session.my_player = 1;
-        session.peer_player = 0;
         std::string target = join;
         const size_t colon = target.rfind(':');
         if (colon == std::string::npos) {
@@ -541,26 +862,21 @@ void init() {
             log_msg("cannot resolve %s; netplay disabled", join);
             return;
         }
-        std::memcpy(&session.peer, result->ai_addr, sizeof(session.peer));
+        std::memcpy(&session.host_address, result->ai_addr, sizeof(session.host_address));
         freeaddrinfo(result);
-        session.have_peer = true;
     }
     if (bind(session.sock, reinterpret_cast<const sockaddr*>(&local), sizeof(local)) != 0) {
         log_msg("cannot bind UDP port %u; netplay disabled", ntohs(local.sin_port));
         return;
     }
 
-    const auto env_uint = [](const char* name, uint32_t max_value) -> uint32_t {
-        const char* value = std::getenv(name);
-        return value != nullptr && *value != '\0' ? std::min<uint32_t>(std::max(std::atoi(value), 0), max_value) : 0;
-    };
-    session.scripted = env_uint("SK1_NET_SCRIPT", 1) != 0;
-    session.sim_loss_percent = env_uint("SK1_NET_SIM_LOSS", 90);
-    session.sim_latency_ms = env_uint("SK1_NET_SIM_LATENCY", 2000);
-    session.sim_jitter_ms = env_uint("SK1_NET_SIM_JITTER", 2000);
-    session.sim_rng.seed(hosting ? 1 : 2);
+    session.scripted = env_uint("SK1_NET_SCRIPT", 0, 1, 0) != 0;
+    session.sim_loss_percent = env_uint("SK1_NET_SIM_LOSS", 0, 90, 0);
+    session.sim_latency_ms = env_uint("SK1_NET_SIM_LATENCY", 0, 2000, 0);
+    session.sim_jitter_ms = env_uint("SK1_NET_SIM_JITTER", 0, 2000, 0);
+    session.sim_rng.seed(hosting ? 1 : 2 + static_cast<uint32_t>(std::atoi(instance != nullptr ? instance : "0")));
     if (session.scripted) {
-        log_msg("scripted input: playing this player's inputs from the replayed recording");
+        log_msg("scripted input: playing this machine's ports from the replayed recording");
     }
     if (session.sim_loss_percent != 0 || session.sim_latency_ms != 0 || session.sim_jitter_ms != 0) {
         log_msg("simulating %u%% outgoing packet loss, %u ms latency, up to %u ms jitter", session.sim_loss_percent,
@@ -568,24 +884,64 @@ void init() {
     }
 
     session.save.assign(save_size, 0);
-    session.remote_next = session.delay;
-    session.peer_ack = session.delay;
+    // Ticks below the input delay have no scheduled input: every port is neutral there.
+    for (PortStream& stream : session.ports) {
+        for (uint32_t t = 0; t < session.delay; t++) {
+            stream.set(t, WireInput{});
+        }
+    }
     session.my_hash_tick.fill(no_tick);
-    session.peer_hash_tick.fill(no_tick);
+    for (auto& ticks : session.peer_hash_tick) {
+        ticks.fill(no_tick);
+    }
     session.enabled = true;
     if (hosting) {
-        log_msg("hosting on UDP port %u as player 1; waiting for player 2", ntohs(local.sin_port));
+        log_msg("hosting on UDP port %u with %u local player(s); waiting for %u more player(s)",
+            ntohs(local.sin_port), session.local_players, session.total_ports - session.local_players);
     } else {
-        log_msg("joining %s as player 2", join);
+        log_msg("joining %s with %u local player(s)", join, session.local_players);
     }
 }
 
 void end_session(const char* reason) {
     if (!session.ended) {
         session.ended = true;
+        session.paused = false;
+        session.waiting_for_host = false;
         log_msg("session ended: %s", reason);
         notify_player(std::string("Netplay session ended: ") + reason +
-                      ". The game continues offline; restart both games to play together again.");
+                      ". The game continues offline; restart the games to play together again.");
+    }
+}
+
+// Host: stop waiting for a joiner that has gone quiet. From the first tick not yet relayed for its ports, the host
+// supplies neutral input for them and relays that like any other input, so every machine stays in step.
+void drop_client(uint8_t index) {
+    Client& client = session.clients[index];
+    if (client.dropped) {
+        return;
+    }
+    client.dropped = true;
+    for (uint32_t i = 0; i < client.local_players; i++) {
+        session.port_states[client.first_port + i] = sk1net::PlayerState::Dropped;
+    }
+    log_msg("continuing without joiner %u: neutral input for ports %u-%u", index + 1, client.first_port + 1,
+        client.first_port + client.local_players);
+}
+
+// Neutral input for ports whose joiner has dropped, up to the newest tick this machine has scheduled.
+void fill_dropped_ports(uint32_t until) {
+    for (uint8_t c = 0; c < max_clients; c++) {
+        const Client& client = session.clients[c];
+        if (!client.used || !client.dropped) {
+            continue;
+        }
+        for (uint32_t i = 0; i < client.local_players; i++) {
+            PortStream& stream = session.ports[client.first_port + i];
+            while (stream.next <= until) {
+                stream.set(stream.next, WireInput{});
+            }
+        }
     }
 }
 
@@ -608,31 +964,220 @@ void wait_for_start() {
     }
     auto last_send = clock_type::time_point{};
     auto last_log = clock_type::now();
-    while (!session.started) {
+    while (!session.started && !session.ended) {
         const auto now = clock_type::now();
-        if (!session.is_host && now - last_send >= hello_interval) {
+        if (session.is_host) {
+            bool all_ready = session.next_free_port == session.total_ports;
+            for (const Client& client : session.clients) {
+                if (client.used && !client.ready) {
+                    all_ready = false;
+                }
+            }
+            if (all_ready) {
+                start_session();
+                for (const Client& client : session.clients) {
+                    if (client.used) {
+                        send_start(client.address);
+                    }
+                }
+                break;
+            }
+        } else if (now - last_send >= hello_interval) {
             last_send = now;
             if (session.welcomed && session.have_mask == all_chunks) {
                 Header r;
                 fill_header(r, Ready);
-                send_raw(&r, sizeof(r));
+                send_to(session.host_address, &r, sizeof(r));
             } else {
                 HelloPacket p{};
                 fill_header(p.header, Hello);
+                p.local_players = session.local_players;
                 p.have_mask = session.have_mask;
-                send_raw(&p, sizeof(p));
+                send_to(session.host_address, &p, sizeof(p));
             }
         }
         if (now - last_log >= std::chrono::seconds(5)) {
             last_log = now;
-            log_msg(session.is_host ? "still waiting for player 2" : "still waiting for the host");
+            if (session.is_host) {
+                log_msg("still waiting: %u of %u players connected", session.next_free_port, session.total_ports);
+            } else {
+                log_msg("still waiting for the host");
+            }
         }
         pump(std::chrono::milliseconds(20));
     }
-    session.last_receive = clock_type::now();
+    const auto now = clock_type::now();
+    session.last_host_receive = now;
+    for (Client& client : session.clients) {
+        client.last_receive = now;
+    }
+}
+
+// Copies the state the overlay needs into its mutex-protected snapshot (read on the UI thread).
+void publish_status() {
+    sk1net::OverlayStatus status;
+    status.paused = session.paused;
+    status.visible = session.started && !session.ended && (session.paused || session.waiting_for_host);
+    status.am_host = session.is_host;
+    status.total_ports = session.total_ports;
+    for (uint32_t p = 0; p < port_count; p++) {
+        sk1net::PlayerStatus& player = status.players[p];
+        player.host = session.owners[p] == host_id;
+        player.local = is_local_port(p);
+        player.state = session.port_states[p];
+        player.ready = (session.ready_mask & (1u << p)) != 0;
+        if (player.state == sk1net::PlayerState::Disconnected) {
+            status.can_continue_without = true;
+        }
+    }
+    static bool forcing_present = false;
+    if (status.visible != forcing_present) {
+        forcing_present = status.visible;
+        rt64_set_force_present(forcing_present ? 1 : 0);
+        log_msg("overlay %s", forcing_present ? "shown (forcing presents)" : "hidden");
+    }
+    std::lock_guard lock{ session.status_mutex };
+    session.status = status;
+}
+
+// Edge-detected button press on one of this machine's controllers (index = local player).
+bool local_button_pressed(uint32_t local_index, uint16_t mask) {
+    uint16_t buttons = 0;
+    float x = 0.0f;
+    float y = 0.0f;
+    recompinput::profiles::get_n64_input(static_cast<int>(local_index), &buttons, &x, &y);
+    const bool down = (buttons & mask) != 0;
+    const bool pressed = down && !session.a_was_down[local_index];
+    session.a_was_down[local_index] = down;
+    return pressed;
+}
+
+constexpr uint16_t n64_button_a = 0x8000;
+constexpr uint16_t n64_button_start = 0x1000;
+
+// Host: refresh each joiner's displayed state from how recently it was heard from and whether it is behind.
+void host_update_port_states(uint32_t needed_tick) {
+    const auto now = clock_type::now();
+    for (uint8_t c = 0; c < max_clients; c++) {
+        const Client& client = session.clients[c];
+        if (!client.used || client.dropped) {
+            continue;
+        }
+        bool behind = false;
+        for (uint32_t i = 0; i < client.local_players; i++) {
+            behind |= session.ports[client.first_port + i].next <= needed_tick;
+        }
+        sk1net::PlayerState state = sk1net::PlayerState::Connected;
+        if (now - client.last_receive > disconnected_after) {
+            state = sk1net::PlayerState::Disconnected;
+        } else if (behind && now - client.last_receive > std::chrono::milliseconds(500)) {
+            state = sk1net::PlayerState::Lagging;
+        }
+        for (uint32_t i = 0; i < client.local_players; i++) {
+            session.port_states[client.first_port + i] = state;
+        }
+    }
+}
+
+void host_begin_pause(const char* reason) {
+    if (session.paused) {
+        return;
+    }
+    session.paused = true;
+    session.pause_id++;
+    session.ready_mask = 0;
+    session.a_was_down.fill(true); // a button already held does not count as ready
+    log_msg("paused (%s)", reason);
+    publish_status();
+    send_inputs();
+}
+
+// Holds this machine's next tick while the session is paused: keeps the network going, collects this machine's A
+// presses (and, on the host, Start to continue without disconnected players) and resumes when the host says so.
+void hold_while_paused(uint32_t needed_tick) {
+    auto last_send = clock_type::time_point{};
+    auto disconnected_since = clock_type::time_point{};
+    while (session.paused && !session.ended) {
+        pump(std::chrono::milliseconds(5));
+        const auto now = clock_type::now();
+        for (uint32_t i = 0; i < session.local_players; i++) {
+            const uint32_t port = session.first_port + i;
+            if (session.scripted || local_button_pressed(i, n64_button_a)) {
+                session.ready_mask |= uint8_t(1u << port);
+            }
+        }
+        if (session.is_host) {
+            host_update_port_states(needed_tick);
+            bool any_disconnected = false;
+            bool all_ready = true;
+            for (uint32_t p = 0; p < session.total_ports; p++) {
+                const sk1net::PlayerState state = session.port_states[p];
+                if (state == sk1net::PlayerState::Dropped) {
+                    continue;
+                }
+                if (state == sk1net::PlayerState::Disconnected) {
+                    any_disconnected = true;
+                    all_ready = false;
+                } else if (!(session.ready_mask & (1u << p))) {
+                    all_ready = false;
+                }
+            }
+            if (any_disconnected) {
+                if (disconnected_since == clock_type::time_point{}) {
+                    disconnected_since = now;
+                }
+                const bool host_chose = !session.scripted && local_button_pressed(0, n64_button_start);
+                const bool test_timeout = session.scripted && now - disconnected_since > scripted_drop_after;
+                if (host_chose || test_timeout) {
+                    for (uint8_t c = 0; c < max_clients; c++) {
+                        const Client& client = session.clients[c];
+                        if (client.used && !client.dropped &&
+                            session.port_states[client.first_port] == sk1net::PlayerState::Disconnected) {
+                            drop_client(c);
+                        }
+                    }
+                    fill_dropped_ports(needed_tick + session.delay);
+                }
+            } else {
+                disconnected_since = {};
+            }
+            if (all_ready) {
+                session.paused = false;
+                log_msg("resumed: every connected player is ready");
+            }
+        } else if (now - session.last_host_receive > peer_timeout) {
+            end_session("no packets from the host for 10 seconds");
+        }
+        if (now - last_send >= resend_interval) {
+            last_send = now;
+            send_inputs();
+        }
+        publish_status();
+    }
+    // Make sure everyone hears about the resume promptly.
+    send_inputs();
+    publish_status();
+}
+
+bool all_inputs_ready(uint32_t t) {
+    for (uint32_t p = 0; p < session.total_ports; p++) {
+        if (session.ports[p].next <= t) {
+            return false;
+        }
+    }
+    return true;
 }
 
 } // namespace
+
+sk1net::OverlayStatus sk1net::overlay_status() {
+    std::lock_guard lock{ session.status_mutex };
+    sk1net::OverlayStatus status = session.status;
+    if (session.ended) {
+        status.visible = false;
+    }
+    return status;
+}
 
 bool sk1net::active() {
     init();
@@ -645,37 +1190,70 @@ void sk1net::pre_tick(uint8_t* rdram, gpr inputs) {
     }
     if (!session.started) {
         wait_for_start();
+        if (!session.started) {
+            return;
+        }
     }
 
-    // Sample this machine's controller (the game's port 0 locally) and schedule it.
-    WireInput mine{};
+    if (session.paused) {
+        hold_while_paused(session.tick);
+    }
+
+    // Sample this machine's controllers (the game's ports 0.. locally) and schedule them.
     const uint32_t scheduled = session.tick + session.delay;
-    if (session.scripted) {
-        sk1det::recorded_input(scheduled, session.my_player, mine.buttons, mine.stick_x, mine.stick_y);
-    } else {
-        mine.buttons = MEM_HU(0, inputs);
-        mine.stick_x = MEM_B(2, inputs);
-        mine.stick_y = MEM_B(3, inputs);
+    for (uint32_t i = 0; i < session.local_players; i++) {
+        const uint32_t port = session.first_port + i;
+        WireInput mine{};
+        if (session.scripted) {
+            sk1det::recorded_input(scheduled, port, mine.buttons, mine.stick_x, mine.stick_y);
+        } else {
+            const gpr addr = inputs + i * 6;
+            mine.buttons = MEM_HU(0, addr);
+            mine.stick_x = MEM_B(2, addr);
+            mine.stick_y = MEM_B(3, addr);
+        }
+        session.ports[port].set(scheduled, mine);
     }
-    if (scheduled >= session.local.size()) {
-        session.local.resize(scheduled + 1024);
+    if (session.is_host) {
+        fill_dropped_ports(scheduled);
     }
-    session.local[scheduled] = mine;
 
     send_inputs();
     const auto wait_start = clock_type::now();
     auto last_send = wait_start;
-    while (session.remote_next <= session.tick) {
+    while (!all_inputs_ready(session.tick)) {
         pump(std::chrono::milliseconds(5));
         const auto now = clock_type::now();
-        if (now - session.last_receive > peer_timeout) {
-            end_session("no packets from the other player for 10 seconds");
-            return;
+        if (session.paused) {
+            // The host paused while we were waiting (joiner), or we paused below (host).
+            hold_while_paused(session.tick);
+            continue;
+        }
+        if (session.is_host) {
+            if (now - wait_start > pause_after) {
+                host_update_port_states(session.tick);
+                host_begin_pause("waiting for a player");
+                continue;
+            }
+        } else {
+            const bool waiting = now - session.last_host_receive > pause_after;
+            if (waiting != session.waiting_for_host) {
+                session.waiting_for_host = waiting;
+                publish_status();
+            }
+            if (now - session.last_host_receive > peer_timeout) {
+                end_session("no packets from the host for 10 seconds");
+                return;
+            }
         }
         if (now - last_send >= resend_interval) {
             last_send = now;
             send_inputs();
         }
+    }
+    if (session.waiting_for_host) {
+        session.waiting_for_host = false;
+        publish_status();
     }
     const auto waited = std::chrono::duration_cast<std::chrono::microseconds>(clock_type::now() - wait_start);
     if (waited > std::chrono::milliseconds(1)) {
@@ -683,19 +1261,21 @@ void sk1net::pre_tick(uint8_t* rdram, gpr inputs) {
         session.stall_total += waited;
         session.stall_max = std::max(session.stall_max, waited);
     }
-    // Drain anything else that has arrived without waiting.
+    // Relay what has just arrived without waiting for the next tick, then drain anything else pending.
+    if (session.is_host) {
+        send_inputs();
+    }
     pump(std::chrono::milliseconds(0));
 
     for (uint32_t port = 0; port < port_count; port++) {
         WireInput in{};
-        if (port == session.my_player) {
-            in = input_at(session.local, session.tick);
-        } else if (port == session.peer_player) {
-            in = input_at(session.remote, session.tick);
+        if (port < session.total_ports) {
+            in = session.ports[port].get(session.tick);
         } else if (session.scripted) {
+            // Unused ports: neutral, or (in a scripted test) the recording's inputs, identical on every machine.
             sk1det::recorded_input(session.tick, port, in.buttons, in.stick_x, in.stick_y);
         }
-        gpr addr = inputs + port * 6;
+        const gpr addr = inputs + port * 6;
         MEM_H(0, addr) = in.buttons;
         MEM_B(2, addr) = in.stick_x;
         MEM_B(3, addr) = in.stick_y;
@@ -703,14 +1283,16 @@ void sk1net::pre_tick(uint8_t* rdram, gpr inputs) {
 }
 
 void sk1net::post_tick(uint32_t state_hash) {
-    if (!active()) {
+    if (!active() || !session.started) {
         return;
     }
     const uint32_t slot = session.tick % hash_history;
     session.my_hash_tick[slot] = session.tick;
     session.my_hash[slot] = state_hash;
     session.last_hash_tick = session.tick;
-    check_hash(session.tick);
+    for (uint8_t peer = 0; peer <= max_clients; peer++) {
+        check_hash(session.tick, peer);
+    }
     if (session.tick != 0 && session.tick % stats_interval == 0) {
         log_msg("tick %u: stalled on %u of the last %u ticks, %.1f ms total, longest %.1f ms; packets sent %llu, "
                 "received %llu", session.tick, session.stalled_ticks, stats_interval,

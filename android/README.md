@@ -41,6 +41,7 @@ N64Recomp/RSPRecomp and the generated code from `scripts/generate-code.py` (see 
    git -C lib/rt64/src/contrib/plume apply ../../../../android/patches/rt64-plume.patch
    git -C lib/rt64/src/contrib/zstd apply ../../../../android/patches/rt64-zstd.patch
    git -C lib/RecompFrontend apply ../../android/patches/recompfrontend.patch
+   git -C lib/N64ModernRuntime apply ../../android/patches/n64modernruntime.patch
    ```
 
 2. Configure and build the native library from a Visual Studio developer shell. Without release tags, set the
@@ -99,3 +100,25 @@ On first launch, pick your legally obtained US Snowboard Kids ROM (`.z64`) when 
 and mods live in the app's external files folder (`Android/data/com.snowboardkids.recomp/files`).
 
 Logs: `adb logcat -s SK1 SDL plume RT64 DEBUG`
+
+## Netplay (experimental)
+
+Up to four players on separate devices (Android or PC) play the same game over a local network. Every device runs
+the whole game and only controller inputs are exchanged (lockstep, `src/game/netplay.cpp`), so all devices need the
+same build and ROM. There is no lobby screen yet; sessions are configured with a text file or environment variables.
+
+- Android: put `netplay.txt` in the app's external files folder before starting the game:
+  - host: `host 7777` (options: `delay=3`, `players=4` for the total in the session, `local=2` for players on
+    this device)
+  - join: `join 192.168.1.20 7777` (option: `local=2`)
+- PC: set `SK1_NET_HOST=7777` (with `SK1_NET_PLAYERS`, `SK1_NET_LOCAL_PLAYERS`, `SK1_NET_DELAY`) or
+  `SK1_NET_JOIN=192.168.1.20:7777` before starting the game. See `src/game/netplay.h` for every option.
+
+The host takes the first player slots and its save is used by everyone for the session (nothing is saved back). If a
+player lags or disconnects the game pauses with a status overlay; play resumes when every connected player presses A,
+or the host presses Start to continue without a disconnected player. Each session is recorded to
+`netplay-recordings/` for later replay with the determinism harness (`src/game/determinism_harness.cpp`).
+Logs: `adb logcat -s SK1net` (Android) or `netplay-*.log` next to the game (PC).
+
+For unattended tests, several copies can run on one PC over 127.0.0.1 with `SK1_NET_BIND`, `SK1_NET_SCRIPT` and a
+recording replayed via `SK1_DET_REPLAY`; `SK1_NET_SIM_LOSS`/`LATENCY`/`JITTER` simulate a poor network.

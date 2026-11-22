@@ -83,10 +83,17 @@ index b9c5458..267e216 100644
  endif()
  
 diff --git a/recompui/include/recompui/recompui.h b/recompui/include/recompui/recompui.h
-index 87caf66..7af3206 100644
+index 87caf66..6485356 100644
 --- a/recompui/include/recompui/recompui.h
 +++ b/recompui/include/recompui/recompui.h
-@@ -76,6 +76,19 @@ namespace recompui {
+@@ -1,4 +1,6 @@
+ #pragma once
++
++#include <functional>
+ #include <memory>
+ #include <string>
+ #include <string_view>
+@@ -76,6 +78,19 @@ namespace recompui {
          ButtonStyle cancel_variant = ButtonStyle::Danger,
          bool focus_on_cancel = true
      );
@@ -106,8 +113,18 @@ index 87caf66..7af3206 100644
      void open_info_prompt(
          const std::string& header_text,
          const std::string& content_text,
+@@ -105,6 +120,9 @@ namespace recompui {
+     void activate_mouse();
+ 
+     void message_box(const char* msg);
++    // Called once per UI frame on the UI thread (with the UI state locked), before input is processed. Lets game code
++    // keep its own overlays up to date without touching UI elements from other threads. Pass {} to remove.
++    void set_frame_hook(std::function<void()> hook);
+ 
+     void set_render_hooks();
+ 
 diff --git a/recompui/src/base/ui_state.cpp b/recompui/src/base/ui_state.cpp
-index 6e231d0..a0161fd 100644
+index 6e231d0..f502297 100644
 --- a/recompui/src/base/ui_state.cpp
 +++ b/recompui/src/base/ui_state.cpp
 @@ -5,6 +5,8 @@
@@ -118,6 +135,40 @@ index 6e231d0..a0161fd 100644
 +#include <fstream>
  
  #include "rt64_render_hooks.h"
+ 
+@@ -689,6 +691,25 @@ void recompui::activate_mouse() {
+     ui_state->update_focus(true, false);
+ }
+ 
++static std::mutex frame_hook_mutex;
++static std::function<void()> frame_hook;
++
++void recompui::set_frame_hook(std::function<void()> hook) {
++    std::lock_guard lock{ frame_hook_mutex };
++    frame_hook = std::move(hook);
++}
++
++static void run_frame_hook() {
++    std::function<void()> hook;
++    {
++        std::lock_guard lock{ frame_hook_mutex };
++        hook = frame_hook;
++    }
++    if (hook) {
++        hook();
++    }
++}
++
+ void draw_hook(plume::RenderCommandList* command_list, plume::RenderFramebuffer* swap_chain_framebuffer) {
+ 
+     apply_background_input_mode();
+@@ -706,6 +727,7 @@ void draw_hook(plume::RenderCommandList* command_list, plume::RenderFramebuffer*
+     std::lock_guard lock{ ui_state_mutex };
+ 
+     recompinput::players::apply_pending_game_player_count();
++    run_frame_hook();
+ 
+     SDL_Event cur_event{};
  
 diff --git a/recompui/src/composites/ui_prompt.cpp b/recompui/src/composites/ui_prompt.cpp
 index eba4f5e..c1c65d4 100644

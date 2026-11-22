@@ -259,6 +259,7 @@ set (SOURCES
     ${CMAKE_SOURCE_DIR}/src/game/recomp_api.cpp
     ${CMAKE_SOURCE_DIR}/src/game/determinism_harness.cpp
     ${CMAKE_SOURCE_DIR}/src/game/netplay.cpp
+    ${CMAKE_SOURCE_DIR}/src/game/netplay_overlay.cpp
     ${CMAKE_SOURCE_DIR}/src/game/recomp_actor_api.cpp
     ${CMAKE_SOURCE_DIR}/src/game/recomp_data_api.cpp
     ${CMAKE_SOURCE_DIR}/src/game/libultra_stubs.cpp

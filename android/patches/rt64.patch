@@ -162,6 +162,66 @@ index 08f83e5..58a3cfe 100755
  #   elif defined(__linux__) || defined(__APPLE__)
          if (SDL_VideoInit(nullptr) != 0) {
              printf("Failed to init SDL2 video: %s\n", SDL_GetError());
+diff --git a/src/hle/rt64_state.cpp b/src/hle/rt64_state.cpp
+index 00ebbf0..6470a68 100644
+--- a/src/hle/rt64_state.cpp
++++ b/src/hle/rt64_state.cpp
+@@ -4,6 +4,8 @@
+ 
+ #include "rt64_state.h"
+ 
++#include <atomic>
++
+ #include <cassert>
+ #include <cinttypes>
+ 
+@@ -1837,6 +1839,9 @@ namespace RT64 {
+         clearExtended();
+     }
+     
++    // Set while the game is intentionally frozen so updateScreen keeps presenting (see rt64_set_force_present).
++    static std::atomic<bool> forcePresentRequested{ false };
++
+     void State::updateScreen(const VI &newVI, bool fromEarlyPresent) {
+         // If the debugger has paused the plugin, keep submitting the last workload and screen VI for rendering and a present event.
+         if (debuggerInspector.paused && !fromEarlyPresent) {
+@@ -1890,8 +1895,9 @@ namespace RT64 {
+                 lastScreenFactorCounter++;
+             }
+ 
+-            // We ignore processing the updateScreen altogether in early present mode.
+-            if (presentEarly) {
++            // We ignore processing the updateScreen altogether in early present mode (unless presents are forced
++            // because the game is deliberately frozen, in which case no early presents arrive).
++            if (presentEarly && !forcePresentRequested.load()) {
+                 return;
+             }
+         }
+@@ -1949,8 +1955,9 @@ namespace RT64 {
+             }
+         }
+         
+-        // We only push a new present event to the timeline when it's necessary.
+-        if (fromEarlyPresent || viDifferent || fbChangesMade || screenChangesMade) {
++        // We only push a new present event to the timeline when it's necessary. While the game is deliberately held
++        // (e.g. a netplay pause) nothing on screen changes, but UI overlays drawn at present time still need updating.
++        if (fromEarlyPresent || viDifferent || fbChangesMade || screenChangesMade || forcePresentRequested.load()) {
+             // Push a new renderer event to the timeline for presenting this VI.
+             present.screenVI = newVI;
+             advancePresent(present, false);
+@@ -2824,4 +2831,10 @@ namespace RT64 {
+             break;
+         }
+     }
+-};
+\ No newline at end of file
++};
++
++// Keeps RT64 presenting every screen update even when the image is unchanged, so UI overlays stay live while the
++// game deliberately stops producing frames (netplay pause). Declared by callers that need it.
++extern "C" void rt64_set_force_present(int enable) {
++    RT64::forcePresentRequested.store(enable != 0);
++}
 diff --git a/src/hle/rt64_workload_queue.h b/src/hle/rt64_workload_queue.h
 index bde2f03..4b7ecdd 100644
 --- a/src/hle/rt64_workload_queue.h
