@@ -2,6 +2,7 @@
 
 #include "game/audio/sound_manager.h"
 #include "game/engine/controller_input.h"
+#include "game/engine/frame_render_task.h"
 #include "game/engine/game_task_scheduler.h"
 #include "game/engine/system_runtime.h"
 #include "game/menu/main_menu/controller_main_menu_flow.h"
@@ -13,6 +14,8 @@
 // is set.
 extern void recomp_det_pre_tick(ControllerInputState* inputs, u8* connectedMask);
 extern void recomp_det_post_tick(RacePlayer* players, u16* mainRngIndex, u16* secondaryRngIndex, s16* frameCounter);
+extern s32 recomp_det_sync_render(void);
+extern s32 recomp_det_ticks_per_update(void);
 extern u16 gMainRngIndex;
 extern u16 gSecondaryRngIndex;
 
@@ -24,6 +27,7 @@ extern u16 gSecondaryRngIndex;
 #define STICK_DIRECTION_MASK 0xFFFF0000
 
 extern s8 gAnalogStickResponseCurve[];
+extern OSMesgQueue gFramebufferRenderDoneQueue;
 extern s32 gPlayerInputHeld[];
 extern s32 gPlayerInputPressed[];
 extern s8 gPlayerStickX[];
@@ -31,8 +35,8 @@ extern s8 gPlayerStickY[];
 void resetRenderScratchAllocator(void);
 s32 updateFramebufferRenderScheduler(void);
 
-// Unchanged from the decompilation apart from the two @recomp calls.
-RECOMP_PATCH void updateGameTaskScheduler(void) {
+// One game tick: the decompiled updateGameTaskScheduler body, unchanged apart from the @recomp additions.
+static void runGameTick(void) {
     s32 playerIndex;
     s32* previousInput;
     ControllerInputState* controllerInput;
@@ -42,6 +46,27 @@ RECOMP_PATCH void updateGameTaskScheduler(void) {
     s32 mappedStickY;
     s8 rawStickX;
     s8 rawStickY;
+
+    // @recomp While the harness or netplay is active, finish every frame still being drawn before the tick runs and
+    // apply its completion here (exactly as gameThreadMain's messages 5 and 6 do). Scene transitions wait for
+    // gPendingFramebufferSwapCount to return to 2, and how many ticks that took depended on the host GPU; now it is
+    // always 2 at the start of a tick, so every machine sees the same value.
+    if (recomp_det_sync_render()) {
+        OSMesg doneMessage;
+        while (gPendingFramebufferSwapCount < 2) {
+            osRecvMesg(&gFramebufferRenderDoneQueue, &doneMessage, OS_MESG_BLOCK);
+            switch (*(s16*)doneMessage) {
+                case 5:
+                    gPendingFramebufferSwapCount++;
+                    gFrameRenderTasks[0].status = gFrameRenderTaskStatuses[0][0] & 0xFFFE;
+                    break;
+                case 6:
+                    gPendingFramebufferSwapCount++;
+                    gFrameRenderTasks[1].status = gFrameRenderTaskStatuses[1][0] & 0xFFFE;
+                    break;
+            }
+        }
+    }
 
     // @recomp Record or inject this tick's controller inputs.
     recomp_det_pre_tick(gControllerInputState, &gConnectedControllerBitmask);
@@ -154,4 +179,15 @@ RECOMP_PATCH void updateGameTaskScheduler(void) {
 
     updateFramebufferRenderScheduler();
     playPendingPositionalSoundRequests();
+}
+
+// @recomp Normally one tick per call. Replays can fast-forward (SK1_DET_SPEED) by running several ticks per call;
+// with render completion synchronised per tick (above) the game logic is unaffected.
+RECOMP_PATCH void updateGameTaskScheduler(void) {
+    s32 ticks = recomp_det_ticks_per_update();
+    s32 i;
+
+    for (i = 0; i < ticks; i++) {
+        runGameTick();
+    }
 }

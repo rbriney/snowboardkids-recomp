@@ -38,6 +38,8 @@ recomp_save_read = 0x8F000114;
 recomp_save_write = 0x8F000118;
 recomp_det_pre_tick = 0x8F00011C;
 recomp_det_post_tick = 0x8F000120;
+recomp_det_sync_render = 0x8F000124;
+recomp_det_ticks_per_update = 0x8F000128;
 sqrtf_recomp = 0x8F0000B8;
 
 /* librecomp / ultramodern reimplementations. Only libultra functions that are

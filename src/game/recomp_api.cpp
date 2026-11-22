@@ -250,7 +250,8 @@ extern "C" void recomp_save_read(uint8_t* rdram, recomp_context* ctx) {
         return;
     }
 
-    if (!sk1det::save_read(rdram, dst, offset, size) && !sk1net::save_read(rdram, dst, offset, size)) {
+    // Netplay's session save takes priority, so a recorded netplay session uses the same save on both sides.
+    if (!sk1net::save_read(rdram, dst, offset, size) && !sk1det::save_read(rdram, dst, offset, size)) {
         save_read(rdram, dst, offset, size);
     }
     _return<s32>(ctx, 1);
@@ -267,7 +268,7 @@ extern "C" void recomp_save_write(uint8_t* rdram, recomp_context* ctx) {
         return;
     }
 
-    if (!sk1det::save_write(rdram, src, offset, size) && !sk1net::save_write(rdram, src, offset, size)) {
+    if (!sk1net::save_write(rdram, src, offset, size) && !sk1det::save_write(rdram, src, offset, size)) {
         save_write(rdram, src, offset, size);
     }
     _return<s32>(ctx, 1);

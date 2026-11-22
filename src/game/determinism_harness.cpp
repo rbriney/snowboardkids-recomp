@@ -14,10 +14,12 @@
 // Hooks: patches/determinism_harness.c calls recomp_det_pre_tick at the start of updateGameTaskScheduler and
 // recomp_det_post_tick after the game tasks have run.
 
+#include <algorithm>
 #include <array>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <ctime>
 #include <filesystem>
 #include <fstream>
 #include <mutex>
@@ -95,6 +97,42 @@ struct State {
     std::vector<uint8_t> save;
 } state;
 
+// Keeps the automatic netplay recordings folder to the newest few sessions (each side writes about 1 MB a minute).
+void prune_old_recordings(const std::filesystem::path& folder) {
+    constexpr size_t keep = 10;
+    std::vector<std::filesystem::path> recordings;
+    std::error_code ec;
+    for (const auto& entry : std::filesystem::directory_iterator(folder, ec)) {
+        if (entry.path().extension() == ".bin") {
+            recordings.push_back(entry.path());
+        }
+    }
+    if (recordings.size() < keep) {
+        return;
+    }
+    std::sort(recordings.begin(), recordings.end(), [](const auto& a, const auto& b) {
+        std::error_code e;
+        return std::filesystem::last_write_time(a, e) < std::filesystem::last_write_time(b, e);
+    });
+    for (size_t i = 0; i + keep - 1 < recordings.size(); i++) {
+        std::filesystem::remove(recordings[i], ec);
+        std::filesystem::path save = recordings[i];
+        save += ".save";
+        std::filesystem::remove(save, ec);
+    }
+}
+
+// Trimmed recordings (idle stretches removed) zero the hashes of every tick after a cut, since the frame counter
+// no longer lines up; those ticks are replayed but not compared.
+bool recorded_hashes_cleared(const TickRecord& rec) {
+    for (uint32_t value : rec.named) {
+        if (value != 0) {
+            return false;
+        }
+    }
+    return true;
+}
+
 const char* named_label(uint32_t index) {
     static const char* labels[named_count] = { "racer 0", "racer 1", "racer 2", "racer 3", "rng/frame counter" };
     return labels[index];
@@ -142,6 +180,33 @@ void init() {
         std::fwrite(file_magic, 1, sizeof(file_magic), state.record_file);
         log_line("recording to %s", state.path.string());
         load_snapshot_ticks();
+        return;
+    }
+
+    if (const char* p = std::getenv("SK1_DET_REPLAY"); p != nullptr && *p != '\0') {
+        // (replay handled below)
+    } else if ((std::getenv("SK1_NET_HOST") != nullptr && *std::getenv("SK1_NET_HOST") != '\0') ||
+               (std::getenv("SK1_NET_JOIN") != nullptr && *std::getenv("SK1_NET_JOIN") != '\0')) {
+        // Netplay sessions record themselves, so a desync (or a good race) can be replayed and examined later.
+        std::filesystem::path folder = std::filesystem::current_path();
+        if (const char* app = std::getenv("APP_FOLDER_PATH"); app != nullptr && *app != '\0') {
+            folder = std::filesystem::u8path(app);
+        }
+        folder /= "netplay-recordings";
+        std::error_code ec;
+        std::filesystem::create_directories(folder, ec);
+        prune_old_recordings(folder);
+        char stamp[32];
+        const std::time_t now = std::time(nullptr);
+        std::strftime(stamp, sizeof(stamp), "%Y%m%d-%H%M%S", std::localtime(&now));
+        const bool hosting = std::getenv("SK1_NET_HOST") != nullptr && *std::getenv("SK1_NET_HOST") != '\0';
+        state.path = folder / (std::string(hosting ? "host-" : "join-") + stamp + ".bin");
+        state.record_file = std::fopen(state.path.string().c_str(), "wb");
+        if (state.record_file != nullptr) {
+            state.mode = Mode::Record;
+            std::fwrite(file_magic, 1, sizeof(file_magic), state.record_file);
+            log_line("recording this netplay session to %s", state.path.string());
+        }
         return;
     }
 
@@ -247,6 +312,33 @@ void load_save_locked() {
 
 } // namespace
 
+bool sk1det::recorded_input(uint32_t tick, uint32_t port, uint16_t& buttons, int8_t& stick_x, int8_t& stick_y) {
+    init();
+    if (state.mode != Mode::Replay || tick >= state.replay.size() || port >= port_count) {
+        return false;
+    }
+    buttons = state.replay[tick].inputs[port].buttons;
+    stick_x = state.replay[tick].inputs[port].stick_x;
+    stick_y = state.replay[tick].inputs[port].stick_y;
+    return true;
+}
+
+bool sk1det::replay_save(std::vector<uint8_t>& out) {
+    init();
+    if (state.mode != Mode::Replay) {
+        return false;
+    }
+    std::filesystem::path save_copy = state.path;
+    save_copy += ".save";
+    std::ifstream in(save_copy, std::ios::binary);
+    if (!in) {
+        return false;
+    }
+    out.assign(save_size, 0);
+    in.read(reinterpret_cast<char*>(out.data()), save_size);
+    return true;
+}
+
 bool sk1det::active() {
     init();
     return state.mode != Mode::Off;
@@ -276,6 +368,23 @@ bool sk1det::save_write(uint8_t* rdram, gpr src, uint32_t offset, uint32_t size)
     return true;
 }
 
+// s32 recomp_det_sync_render(void): nonzero while the harness or netplay is active, telling the tick patch to finish
+// outstanding frames before each tick so renderer timing cannot change game state.
+extern "C" void recomp_det_sync_render(uint8_t* rdram, recomp_context* ctx) {
+    _return<s32>(ctx, (sk1det::active() || sk1net::active()) ? 1 : 0);
+}
+
+// s32 recomp_det_ticks_per_update(void): game ticks per scheduler update. 1 normally; SK1_DET_SPEED=<n> (1-8)
+// fast-forwards a replay that is not part of a netplay session.
+extern "C" void recomp_det_ticks_per_update(uint8_t* rdram, recomp_context* ctx) {
+    static const int32_t speed = [] {
+        const char* value = std::getenv("SK1_DET_SPEED");
+        return value != nullptr ? std::clamp(std::atoi(value), 1, 8) : 1;
+    }();
+    const bool fast = speed > 1 && state.mode == Mode::Replay && !state.replay_finished && !sk1net::active();
+    _return<s32>(ctx, fast ? speed : 1);
+}
+
 // void recomp_det_pre_tick(ControllerInputState* inputs, u8* connectedMask)
 extern "C" void recomp_det_pre_tick(uint8_t* rdram, recomp_context* ctx) {
     // Netplay supplies the inputs first, so a netplay session can also be recorded by the harness.
@@ -296,11 +405,15 @@ extern "C" void recomp_det_pre_tick(uint8_t* rdram, recomp_context* ctx) {
             log_line("warning: connected controllers differ from the recording (%s)",
                 std::to_string(MEM_BU(0, mask)) + " vs " + std::to_string(recorded.connected_mask));
         }
-        for (uint32_t port = 0; port < port_count; port++) {
-            gpr addr = inputs + port * 6;
-            MEM_H(0, addr) = recorded.inputs[port].buttons;
-            MEM_B(2, addr) = recorded.inputs[port].stick_x;
-            MEM_B(3, addr) = recorded.inputs[port].stick_y;
+        // During netplay the session supplies the inputs (scripted from this recording when SK1_NET_SCRIPT is
+        // set) and the harness only compares the resulting game state.
+        if (!sk1net::active()) {
+            for (uint32_t port = 0; port < port_count; port++) {
+                gpr addr = inputs + port * 6;
+                MEM_H(0, addr) = recorded.inputs[port].buttons;
+                MEM_B(2, addr) = recorded.inputs[port].stick_x;
+                MEM_B(3, addr) = recorded.inputs[port].stick_y;
+            }
         }
     } else if (state.mode == Mode::Replay && !state.replay_finished) {
         state.replay_finished = true;
@@ -360,12 +473,23 @@ extern "C" void recomp_det_post_tick(uint8_t* rdram, recomp_context* ctx) {
         log_line("wrote %s", snapshot.string());
     }
 
+    if (state.mode == Mode::Record && state.tick == 0 && netplay) {
+        std::vector<uint8_t> session_save;
+        if (sk1net::session_save(session_save)) {
+            std::filesystem::path save_copy = state.path;
+            save_copy += ".save";
+            std::ofstream out(save_copy, std::ios::binary | std::ios::trunc);
+            out.write(reinterpret_cast<const char*>(session_save.data()), session_save.size());
+        }
+    }
+
     if (state.mode == Mode::Record) {
         std::fwrite(&rec, sizeof(rec), 1, state.record_file);
         if ((state.tick % 30) == 0) {
             std::fflush(state.record_file);
         }
-    } else if (state.mode == Mode::Replay && state.tick < state.replay.size()) {
+    } else if (state.mode == Mode::Replay && state.tick < state.replay.size() &&
+               !recorded_hashes_cleared(state.replay[state.tick])) {
         const TickRecord& recorded = state.replay[state.tick];
         state.compared_ticks++;
         bool named_mismatch = false;

@@ -18,8 +18,11 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <deque>
 #include <mutex>
+#include <random>
 #include <string>
+#include <thread>
 #include <vector>
 
 #ifdef _WIN32
@@ -42,9 +45,16 @@
 #include <android/log.h>
 #endif
 
+#ifdef _WIN32
+#include "SDL.h"
+#else
+#include "SDL2/SDL.h"
+#endif
+
 #include "recomp.h"
 #include "ultramodern/ultramodern.hpp"
 #include "netplay.h"
+#include "determinism_harness.h"
 
 namespace {
 
@@ -153,7 +163,28 @@ struct Session {
     bool desync_reported = false;
 
     FILE* log = nullptr;
+
+    // Testing aids (see netplay.h).
+    bool scripted = false;
+    uint32_t sim_loss_percent = 0;
+    uint32_t sim_latency_ms = 0;
+    uint32_t sim_jitter_ms = 0;
+    std::mt19937 sim_rng{ 12345 };
+    struct DelayedPacket {
+        clock_type::time_point due;
+        std::vector<uint8_t> data;
+    };
+    std::deque<DelayedPacket> sim_queue;
+
+    // Statistics, logged every stats_interval ticks.
+    std::chrono::microseconds stall_total{ 0 };
+    std::chrono::microseconds stall_max{ 0 };
+    uint32_t stalled_ticks = 0;
+    uint64_t packets_sent = 0;
+    uint64_t packets_received = 0;
 } session;
+
+constexpr uint32_t stats_interval = 900; // 30 seconds of game time
 
 void log_msg(const char* fmt, ...) {
     char buffer[512];
@@ -172,6 +203,15 @@ void log_msg(const char* fmt, ...) {
     }
 }
 
+void notify_player(const std::string& message) {
+    if (session.scripted) {
+        return;
+    }
+    std::thread([message] {
+        SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_WARNING, "Snowboard Kids netplay", message.c_str(), nullptr);
+    }).detach();
+}
+
 void fill_header(Header& h, PacketType type) {
     h.magic = packet_magic;
     h.version = protocol_version;
@@ -179,12 +219,46 @@ void fill_header(Header& h, PacketType type) {
     h.player = session.my_player;
 }
 
+void send_now(const void* data, size_t size) {
+    sendto(session.sock, reinterpret_cast<const char*>(data), static_cast<int>(size), 0,
+        reinterpret_cast<const sockaddr*>(&session.peer), sizeof(session.peer));
+    session.packets_sent++;
+}
+
+// Sends delayed packets whose time has come (network simulation only).
+void flush_delayed() {
+    const auto now = clock_type::now();
+    while (!session.sim_queue.empty() && session.sim_queue.front().due <= now) {
+        send_now(session.sim_queue.front().data.data(), session.sim_queue.front().data.size());
+        session.sim_queue.pop_front();
+    }
+}
+
 void send_raw(const void* data, size_t size) {
     if (!session.have_peer) {
         return;
     }
-    sendto(session.sock, reinterpret_cast<const char*>(data), static_cast<int>(size), 0,
-        reinterpret_cast<const sockaddr*>(&session.peer), sizeof(session.peer));
+    if (session.sim_loss_percent != 0 && (session.sim_rng() % 100) < session.sim_loss_percent) {
+        return;
+    }
+    if (session.sim_latency_ms != 0 || session.sim_jitter_ms != 0) {
+        uint32_t delay_ms = session.sim_latency_ms;
+        if (session.sim_jitter_ms != 0) {
+            delay_ms += session.sim_rng() % (session.sim_jitter_ms + 1);
+        }
+        const uint8_t* bytes = static_cast<const uint8_t*>(data);
+        Session::DelayedPacket packet{ clock_type::now() + std::chrono::milliseconds(delay_ms),
+            std::vector<uint8_t>(bytes, bytes + size) };
+        // Keep the queue ordered by due time (jitter can reorder packets, as a real network can).
+        auto it = session.sim_queue.end();
+        while (it != session.sim_queue.begin() && std::prev(it)->due > packet.due) {
+            --it;
+        }
+        session.sim_queue.insert(it, std::move(packet));
+        flush_delayed();
+        return;
+    }
+    send_now(data, size);
 }
 
 WireInput input_at(const std::vector<WireInput>& inputs, uint32_t t) {
@@ -222,6 +296,8 @@ void check_hash(uint32_t t) {
     if (session.my_hash[slot] != session.peer_hash[slot] && !session.desync_reported) {
         session.desync_reported = true;
         log_msg("DESYNC: game state differs from the peer's at tick %u", t);
+        notify_player("The two games have gone out of sync, so they may no longer show the same race. "
+                      "Restart both games to play again.");
     }
 }
 
@@ -350,6 +426,12 @@ void process_packet(const uint8_t* data, size_t size, const sockaddr_in& from) {
 
 // Receive and process packets, waiting up to timeout for the first one.
 void pump(std::chrono::milliseconds timeout) {
+    flush_delayed();
+    if (!session.sim_queue.empty()) {
+        const auto until_due = std::chrono::duration_cast<std::chrono::milliseconds>(
+            session.sim_queue.front().due - clock_type::now());
+        timeout = std::max(std::chrono::milliseconds(0), std::min(timeout, until_due));
+    }
     fd_set fds;
     FD_ZERO(&fds);
     FD_SET(session.sock, &fds);
@@ -368,6 +450,7 @@ void pump(std::chrono::milliseconds timeout) {
         if (received <= 0) {
             break;
         }
+        session.packets_received++;
         process_packet(buffer, static_cast<size_t>(received), from);
     }
 }
@@ -382,12 +465,12 @@ bool set_non_blocking(socket_t s) {
 #endif
 }
 
-void open_log() {
+void open_log(bool hosting) {
     std::filesystem::path folder = std::filesystem::current_path();
     if (const char* app = std::getenv("APP_FOLDER_PATH"); app != nullptr && *app != '\0') {
         folder = std::filesystem::u8path(app);
     }
-    session.log = std::fopen((folder / "netplay.log").string().c_str(), "w");
+    session.log = std::fopen((folder / (hosting ? "netplay-host.log" : "netplay-join.log")).string().c_str(), "w");
 }
 
 void init() {
@@ -403,7 +486,7 @@ void init() {
     if (!hosting && !joining) {
         return;
     }
-    open_log();
+    open_log(hosting);
 
 #ifdef _WIN32
     WSADATA wsa;
@@ -428,6 +511,9 @@ void init() {
     sockaddr_in local{};
     local.sin_family = AF_INET;
     local.sin_addr.s_addr = htonl(INADDR_ANY);
+    if (const char* bind_address = std::getenv("SK1_NET_BIND"); bind_address != nullptr && *bind_address != 0) {
+        inet_pton(AF_INET, bind_address, &local.sin_addr);
+    }
     if (hosting) {
         session.is_host = true;
         session.my_player = 0;
@@ -464,6 +550,23 @@ void init() {
         return;
     }
 
+    const auto env_uint = [](const char* name, uint32_t max_value) -> uint32_t {
+        const char* value = std::getenv(name);
+        return value != nullptr && *value != '\0' ? std::min<uint32_t>(std::max(std::atoi(value), 0), max_value) : 0;
+    };
+    session.scripted = env_uint("SK1_NET_SCRIPT", 1) != 0;
+    session.sim_loss_percent = env_uint("SK1_NET_SIM_LOSS", 90);
+    session.sim_latency_ms = env_uint("SK1_NET_SIM_LATENCY", 2000);
+    session.sim_jitter_ms = env_uint("SK1_NET_SIM_JITTER", 2000);
+    session.sim_rng.seed(hosting ? 1 : 2);
+    if (session.scripted) {
+        log_msg("scripted input: playing this player's inputs from the replayed recording");
+    }
+    if (session.sim_loss_percent != 0 || session.sim_latency_ms != 0 || session.sim_jitter_ms != 0) {
+        log_msg("simulating %u%% outgoing packet loss, %u ms latency, up to %u ms jitter", session.sim_loss_percent,
+            session.sim_latency_ms, session.sim_jitter_ms);
+    }
+
     session.save.assign(save_size, 0);
     session.remote_next = session.delay;
     session.peer_ack = session.delay;
@@ -481,17 +584,25 @@ void end_session(const char* reason) {
     if (!session.ended) {
         session.ended = true;
         log_msg("session ended: %s", reason);
+        notify_player(std::string("Netplay session ended: ") + reason +
+                      ". The game continues offline; restart both games to play together again.");
     }
 }
 
 // Blocks the game thread until the handshake completes (at the first game tick).
 void wait_for_start() {
     if (session.is_host) {
-        // The host's save is the session save.
-        std::ifstream in(ultramodern::get_save_file_path(), std::ios::binary);
-        if (in) {
+        // The host's save is the session save (when replaying a recording for a test, the save it started from).
+        std::vector<uint8_t> recorded;
+        if (sk1det::replay_save(recorded)) {
             std::lock_guard lock{ session.save_mutex };
-            in.read(reinterpret_cast<char*>(session.save.data()), save_size);
+            session.save = recorded;
+        } else {
+            std::ifstream in(ultramodern::get_save_file_path(), std::ios::binary);
+            if (in) {
+                std::lock_guard lock{ session.save_mutex };
+                in.read(reinterpret_cast<char*>(session.save.data()), save_size);
+            }
         }
         session.have_mask = all_chunks;
     }
@@ -538,17 +649,22 @@ void sk1net::pre_tick(uint8_t* rdram, gpr inputs) {
 
     // Sample this machine's controller (the game's port 0 locally) and schedule it.
     WireInput mine{};
-    mine.buttons = MEM_HU(0, inputs);
-    mine.stick_x = MEM_B(2, inputs);
-    mine.stick_y = MEM_B(3, inputs);
     const uint32_t scheduled = session.tick + session.delay;
+    if (session.scripted) {
+        sk1det::recorded_input(scheduled, session.my_player, mine.buttons, mine.stick_x, mine.stick_y);
+    } else {
+        mine.buttons = MEM_HU(0, inputs);
+        mine.stick_x = MEM_B(2, inputs);
+        mine.stick_y = MEM_B(3, inputs);
+    }
     if (scheduled >= session.local.size()) {
         session.local.resize(scheduled + 1024);
     }
     session.local[scheduled] = mine;
 
     send_inputs();
-    auto last_send = clock_type::now();
+    const auto wait_start = clock_type::now();
+    auto last_send = wait_start;
     while (session.remote_next <= session.tick) {
         pump(std::chrono::milliseconds(5));
         const auto now = clock_type::now();
@@ -561,6 +677,12 @@ void sk1net::pre_tick(uint8_t* rdram, gpr inputs) {
             send_inputs();
         }
     }
+    const auto waited = std::chrono::duration_cast<std::chrono::microseconds>(clock_type::now() - wait_start);
+    if (waited > std::chrono::milliseconds(1)) {
+        session.stalled_ticks++;
+        session.stall_total += waited;
+        session.stall_max = std::max(session.stall_max, waited);
+    }
     // Drain anything else that has arrived without waiting.
     pump(std::chrono::milliseconds(0));
 
@@ -570,6 +692,8 @@ void sk1net::pre_tick(uint8_t* rdram, gpr inputs) {
             in = input_at(session.local, session.tick);
         } else if (port == session.peer_player) {
             in = input_at(session.remote, session.tick);
+        } else if (session.scripted) {
+            sk1det::recorded_input(session.tick, port, in.buttons, in.stick_x, in.stick_y);
         }
         gpr addr = inputs + port * 6;
         MEM_H(0, addr) = in.buttons;
@@ -587,6 +711,16 @@ void sk1net::post_tick(uint32_t state_hash) {
     session.my_hash[slot] = state_hash;
     session.last_hash_tick = session.tick;
     check_hash(session.tick);
+    if (session.tick != 0 && session.tick % stats_interval == 0) {
+        log_msg("tick %u: stalled on %u of the last %u ticks, %.1f ms total, longest %.1f ms; packets sent %llu, "
+                "received %llu", session.tick, session.stalled_ticks, stats_interval,
+            session.stall_total.count() / 1000.0, session.stall_max.count() / 1000.0,
+            static_cast<unsigned long long>(session.packets_sent),
+            static_cast<unsigned long long>(session.packets_received));
+        session.stalled_ticks = 0;
+        session.stall_total = std::chrono::microseconds(0);
+        session.stall_max = std::chrono::microseconds(0);
+    }
     session.tick++;
 }
 
@@ -602,6 +736,15 @@ bool sk1net::save_read(uint8_t* rdram, gpr dst, uint32_t offset, uint32_t size) 
     for (uint32_t i = 0; i < size; i++) {
         MEM_B(i, dst) = session.save[offset + i];
     }
+    return true;
+}
+
+bool sk1net::session_save(std::vector<uint8_t>& out) {
+    if (!session.enabled || !session.started) {
+        return false;
+    }
+    std::lock_guard lock{ session.save_mutex };
+    out = session.save;
     return true;
 }
 

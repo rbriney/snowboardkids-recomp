@@ -1,6 +1,7 @@
 #include "sk1_launcher.h"
 #include "game_regions.h"
 
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <functional>
@@ -437,6 +438,16 @@ void on_launcher_update(recompui::LauncherMenu*) {
     if (initial_focus_pending && start_option != nullptr) {
         start_option->focus();
         initial_focus_pending = false;
+    }
+    // SK1_AUTOSTART=1 starts the selected game without waiting for input (unattended netplay/determinism tests).
+    static bool autostart_checked = false;
+    if (!autostart_checked) {
+        autostart_checked = true;
+        const char* autostart = std::getenv("SK1_AUTOSTART");
+        if (autostart != nullptr && *autostart != '\0' && *autostart != '0' && rom_valid) {
+            start_or_select_rom();
+            return;
+        }
     }
     if (auto requested = sk1::take_restart_game()) {
         for (size_t index = 0; index < games.size(); ++index) {
