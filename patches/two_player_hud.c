@@ -41,6 +41,10 @@ void anchorVerticalHudGroup(s32 side) {
     gEXSetRectAlign(gRegionAllocPtr++, origin, origin, offset, 0, offset, 0);
 }
 
+// Netplay own view (src/game/netplay.cpp): the port this device shows full screen, or -1.
+extern s32 recomp_get_netplay_view_port(void);
+extern void drawSinglePlayerRaceHudForPlayer(s32 player);
+
 RECOMP_PATCH void drawTwoPlayerRaceHud(void *arg0) {
     s32 y;
     s32 x;
@@ -49,6 +53,12 @@ RECOMP_PATCH void drawTwoPlayerRaceHud(void *arg0) {
     char buffer[32];
     // @recomp Select corner placement only for the vertical two-player race layout.
     s32 vertical = raceUsesVerticalTwoPlayerSplit();
+
+    // @recomp Netplay own view: the local player's view fills the screen, so use the one-player HUD layout.
+    if (recomp_get_netplay_view_port() == gCurrentViewportIndex) {
+        drawSinglePlayerRaceHudForPlayer(gCurrentViewportIndex);
+        return;
+    }
 
     if (gCurrentViewportIndex == 0) {
         y = -0x28;
@@ -178,6 +188,11 @@ RECOMP_PATCH void drawTwoPlayerRaceHud(void *arg0) {
 RECOMP_PATCH void drawTwoPlayerLapCounter(void *arg0) {
     s32 y;
     s32 viewportIndex;
+
+    // @recomp Netplay own view: the one-player HUD (drawTwoPlayerRaceHud) already shows the lap.
+    if (recomp_get_netplay_view_port() == gCurrentViewportIndex) {
+        return;
+    }
 
     // @recomp Select corner placement only for the vertical two-player race layout.
     s32 vertical = raceUsesVerticalTwoPlayerSplit();

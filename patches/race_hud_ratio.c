@@ -50,14 +50,18 @@ static void hudEndAnchoredDraw(void) {
                   HUD_SCREEN_HEIGHT);
 }
 
+// @recomp Whose data the single-player HUD shows. Always player 1 in the original game; netplay own view
+// (patches/two_player_hud.c) uses this layout for the local player in a multiplayer race.
+static s32 sSinglePlayerHudPlayer = 0;
+
 RECOMP_PATCH void drawSinglePlayerRaceHud(void *arg0) {
     s32 palette;
     s32 i;
     s32 var_s1;
     char buffer[0x20];
 
-    _Sprintf(buffer, gRaceHudSinglePlayerScoreFormat, gRacePlayers[0].state.score);
-    if (gRacePlayers[0].state.score < 100) {
+    _Sprintf(buffer, gRaceHudSinglePlayerScoreFormat, gRacePlayers[sSinglePlayerHudPlayer].state.score);
+    if (gRacePlayers[sSinglePlayerHudPlayer].state.score < 100) {
         palette = 0x10;
     } else {
         palette = 0xE;
@@ -91,37 +95,37 @@ RECOMP_PATCH void drawSinglePlayerRaceHud(void *arg0) {
     // @recomp Keep the held-item and action-effect sprites around the safe-area centre.
     hudAnchor(G_EX_ORIGIN_CENTER);
 
-    if (gRacePlayers[0].state.shotPalette != 0) {
+    if (gRacePlayers[sSinglePlayerHudPlayer].state.shotPalette != 0) {
         drawScaledAssetTableSprite(
             -0x20,
             -0x60,
             getRelocatableHeapBlockBase(RACE_HUD_POPUP_FONT_HANDLE),
-            gRaceHudShotTileOffsets[gRacePlayers[0].state.shotType] + gRacePlayers[0].state.shotCount - 1,
-            gRacePlayers[0].state.shotPalette
+            gRaceHudShotTileOffsets[gRacePlayers[sSinglePlayerHudPlayer].state.shotType] + gRacePlayers[sSinglePlayerHudPlayer].state.shotCount - 1,
+            gRacePlayers[sSinglePlayerHudPlayer].state.shotPalette
         );
     } else {
         drawAssetTableSprite(
             -0x20,
             -0x60,
             getRelocatableHeapBlockBase(RACE_HUD_POPUP_FONT_HANDLE),
-            gRaceHudShotTileOffsets[gRacePlayers[0].state.shotType] + gRacePlayers[0].state.shotCount - 1
+            gRaceHudShotTileOffsets[gRacePlayers[sSinglePlayerHudPlayer].state.shotType] + gRacePlayers[sSinglePlayerHudPlayer].state.shotCount - 1
         );
     }
 
-    if (gRacePlayers[0].state.itemPalette != 0) {
+    if (gRacePlayers[sSinglePlayerHudPlayer].state.itemPalette != 0) {
         drawScaledAssetTableSprite(
             0,
             -0x60,
             getRelocatableHeapBlockBase(RACE_HUD_POPUP_FONT_HANDLE),
-            gRaceHudItemTileIds[gRacePlayers[0].state.itemType],
-            gRacePlayers[0].state.itemPalette
+            gRaceHudItemTileIds[gRacePlayers[sSinglePlayerHudPlayer].state.itemType],
+            gRacePlayers[sSinglePlayerHudPlayer].state.itemPalette
         );
     } else {
         drawAssetTableSprite(
             0,
             -0x60,
             getRelocatableHeapBlockBase(RACE_HUD_POPUP_FONT_HANDLE),
-            gRaceHudItemTileIds[gRacePlayers[0].state.itemType]
+            gRaceHudItemTileIds[gRacePlayers[sSinglePlayerHudPlayer].state.itemType]
         );
     }
 
@@ -132,14 +136,14 @@ RECOMP_PATCH void drawSinglePlayerRaceHud(void *arg0) {
         -0x88,
         0x40,
         getRelocatableHeapBlockBase(RACE_HUD_POPUP_FONT_HANDLE),
-        gRacePlayers[0].state.rankIndex
+        gRacePlayers[sSinglePlayerHudPlayer].state.rankIndex
     );
     drawAssetTableSprite(-0x88, -0x60, getRelocatableHeapBlockBase(RACE_HUD_POPUP_FONT_HANDLE), 0x39);
     drawAssetTableSpriteWithExplicitPalette(
         -0x68,
         -0x60,
         getRelocatableHeapBlockBase(RACE_HUD_POPUP_FONT_HANDLE),
-        gRacePlayers[0].state.lapDigit + 0x2C,
+        gRacePlayers[sSinglePlayerHudPlayer].state.lapDigit + 0x2C,
         0xE
     );
     drawAssetTableSprite(-0x5C, -0x60, getRelocatableHeapBlockBase(RACE_HUD_POPUP_FONT_HANDLE), 0x38);
@@ -153,6 +157,12 @@ RECOMP_PATCH void drawSinglePlayerRaceHud(void *arg0) {
 
     // @recomp Restore the original rectangle state after the single-player HUD.
     hudEndAnchoredDraw();
+}
+
+void drawSinglePlayerRaceHudForPlayer(s32 player) {
+    sSinglePlayerHudPlayer = player;
+    drawSinglePlayerRaceHud(NULL);
+    sSinglePlayerHudPlayer = 0;
 }
 
 RECOMP_PATCH void drawThreePlayerNoEntryPanel(void *arg0) {
