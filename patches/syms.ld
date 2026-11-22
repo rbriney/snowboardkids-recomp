@@ -36,6 +36,8 @@ recomp_get_vertical_2p_split_screen_enabled = 0x8F000110;
 recomp_set_game_player_count = 0x8F00010C;
 recomp_save_read = 0x8F000114;
 recomp_save_write = 0x8F000118;
+recomp_det_pre_tick = 0x8F00011C;
+recomp_det_post_tick = 0x8F000120;
 sqrtf_recomp = 0x8F0000B8;
 
 /* librecomp / ultramodern reimplementations. Only libultra functions that are

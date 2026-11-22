@@ -58,6 +58,17 @@ namespace sk1android {
                 __android_log_print(ANDROID_LOG_INFO, "SK1", "diagnostic flag %s enabled", flag);
             }
         }
+        // Determinism harness (src/game/determinism_harness.cpp): put a recording at det/replay.bin to replay it, or
+        // create det/record to record to det/record.bin.
+        // The app creates det/ itself: a folder created by adb is not readable by the app.
+        const std::filesystem::path det_folder = external_root / "det";
+        std::error_code det_error;
+        std::filesystem::create_directories(det_folder, det_error);
+        if (std::filesystem::exists(det_folder / "replay.bin", det_error)) {
+            setenv("SK1_DET_REPLAY", (det_folder / "replay.bin").c_str(), 1);
+        } else if (std::filesystem::exists(det_folder / "record", det_error)) {
+            setenv("SK1_DET_RECORD", (det_folder / "record.bin").c_str(), 1);
+        }
         __android_log_print(ANDROID_LOG_INFO, "SK1", "paths: internal=%s assets=%s external=%s",
                             internal_root.c_str(), asset_root.c_str(), external_root.c_str());
     }

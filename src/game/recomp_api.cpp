@@ -13,6 +13,7 @@
 #include "librecomp/helpers.hpp"
 #include "ultramodern/ultramodern.hpp"
 #include "ultramodern/config.hpp"
+#include "determinism_harness.h"
 
 extern "C" void recomp_update_inputs(uint8_t* rdram, recomp_context* ctx) {
     recompinput::poll_inputs();
@@ -218,6 +219,10 @@ extern "C" void recomp_set_right_analog_suppressed(uint8_t* rdram, recomp_contex
 
 extern "C" void recomp_set_game_player_count(uint8_t* rdram, recomp_context* ctx) {
     u32 player_count = _arg<0, u32>(rdram, ctx);
+    // The determinism harness supplies every port's input, so skip the controller-assignment screen.
+    if (sk1det::active()) {
+        return;
+    }
     if (player_count >= 1 && player_count <= 4) {
         recompinput::players::request_game_player_count(player_count);
     }
@@ -244,7 +249,9 @@ extern "C" void recomp_save_read(uint8_t* rdram, recomp_context* ctx) {
         return;
     }
 
-    save_read(rdram, dst, offset, size);
+    if (!sk1det::save_read(rdram, dst, offset, size)) {
+        save_read(rdram, dst, offset, size);
+    }
     _return<s32>(ctx, 1);
 }
 
@@ -259,6 +266,8 @@ extern "C" void recomp_save_write(uint8_t* rdram, recomp_context* ctx) {
         return;
     }
 
-    save_write(rdram, src, offset, size);
+    if (!sk1det::save_write(rdram, src, offset, size)) {
+        save_write(rdram, src, offset, size);
+    }
     _return<s32>(ctx, 1);
 }

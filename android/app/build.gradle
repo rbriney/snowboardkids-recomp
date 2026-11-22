@@ -40,6 +40,9 @@ android {
     buildTypes {
         debug {
             debuggable true
+            // Installs alongside the release build, so testing never replaces a user's install or its data.
+            applicationIdSuffix '.dev'
+            versionNameSuffix '-dev'
         }
         release {
             minifyEnabled false

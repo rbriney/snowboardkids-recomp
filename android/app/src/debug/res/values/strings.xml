@@ -1,0 +1,4 @@
+<resources>
+    <!-- Debug builds install alongside the release app (applicationIdSuffix .dev). -->
+    <string name="app_name">Snowboard Kids Dev</string>
+</resources>
