@@ -9,6 +9,8 @@
 #include <atomic>
 #include <condition_variable>
 #include <cstdlib>
+#include <fstream>
+#include <string>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -68,6 +70,23 @@ namespace sk1android {
             setenv("SK1_DET_REPLAY", (det_folder / "replay.bin").c_str(), 1);
         } else if (std::filesystem::exists(det_folder / "record", det_error)) {
             setenv("SK1_DET_RECORD", (det_folder / "record.bin").c_str(), 1);
+        }
+        // Netplay (src/game/netplay.cpp): netplay.txt holds "host <port> [delay]" or "join <address> <port>".
+        if (std::ifstream netplay_config{ external_root / "netplay.txt" }) {
+            std::string mode;
+            std::string first;
+            std::string second;
+            netplay_config >> mode >> first >> second;
+            if (mode == "host" && !first.empty()) {
+                setenv("SK1_NET_HOST", first.c_str(), 1);
+                if (!second.empty()) {
+                    setenv("SK1_NET_DELAY", second.c_str(), 1);
+                }
+            } else if (mode == "join" && !first.empty() && !second.empty()) {
+                setenv("SK1_NET_JOIN", (first + ":" + second).c_str(), 1);
+            }
+            __android_log_print(ANDROID_LOG_INFO, "SK1", "netplay.txt: %s %s %s", mode.c_str(), first.c_str(),
+                                second.c_str());
         }
         __android_log_print(ANDROID_LOG_INFO, "SK1", "paths: internal=%s assets=%s external=%s",
                             internal_root.c_str(), asset_root.c_str(), external_root.c_str());

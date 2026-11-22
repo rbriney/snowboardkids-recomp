@@ -258,6 +258,7 @@ set (SOURCES
     ${CMAKE_SOURCE_DIR}/src/game/quicksaving.cpp
     ${CMAKE_SOURCE_DIR}/src/game/recomp_api.cpp
     ${CMAKE_SOURCE_DIR}/src/game/determinism_harness.cpp
+    ${CMAKE_SOURCE_DIR}/src/game/netplay.cpp
     ${CMAKE_SOURCE_DIR}/src/game/recomp_actor_api.cpp
     ${CMAKE_SOURCE_DIR}/src/game/recomp_data_api.cpp
     ${CMAKE_SOURCE_DIR}/src/game/libultra_stubs.cpp
@@ -365,7 +366,7 @@ if (WIN32)
     )
 
     target_sources(SnowboardKidsRecompiled PRIVATE ${CMAKE_SOURCE_DIR}/icons/app.rc)
-    target_link_libraries(SnowboardKidsRecompiled PRIVATE SDL2 Winmm.lib)
+    target_link_libraries(SnowboardKidsRecompiled PRIVATE SDL2 Winmm.lib Ws2_32.lib)
 endif()
 
 if (APPLE)

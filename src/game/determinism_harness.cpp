@@ -29,6 +29,7 @@
 #include "librecomp/helpers.hpp"
 #include "ultramodern/ultramodern.hpp"
 #include "determinism_harness.h"
+#include "netplay.h"
 
 #ifdef __ANDROID__
 #include <android/log.h>
@@ -277,6 +278,8 @@ bool sk1det::save_write(uint8_t* rdram, gpr src, uint32_t offset, uint32_t size)
 
 // void recomp_det_pre_tick(ControllerInputState* inputs, u8* connectedMask)
 extern "C" void recomp_det_pre_tick(uint8_t* rdram, recomp_context* ctx) {
+    // Netplay supplies the inputs first, so a netplay session can also be recorded by the harness.
+    sk1net::pre_tick(rdram, ctx->r4);
     if (!sk1det::active()) {
         return;
     }
@@ -316,7 +319,9 @@ extern "C" void recomp_det_pre_tick(uint8_t* rdram, recomp_context* ctx) {
 
 // void recomp_det_post_tick(RacePlayer* players, u16* mainRngIndex, u16* secondaryRngIndex, s16* frameCounter)
 extern "C" void recomp_det_post_tick(uint8_t* rdram, recomp_context* ctx) {
-    if (!sk1det::active()) {
+    const bool harness = sk1det::active();
+    const bool netplay = sk1net::active();
+    if (!harness && !netplay) {
         return;
     }
     gpr players = ctx->r4;
@@ -324,12 +329,25 @@ extern "C" void recomp_det_post_tick(uint8_t* rdram, recomp_context* ctx) {
     gpr secondary_rng = ctx->r6;
     gpr frame_counter = ctx->r7;
 
-    TickRecord& rec = state.current;
+    uint32_t named[named_count];
     for (uint32_t i = 0; i < racer_count; i++) {
-        rec.named[i] = hash_words(rdram, players + i * racer_size, racer_size);
+        named[i] = hash_words(rdram, players + i * racer_size, racer_size);
     }
-    rec.named[rng_named_index] = (static_cast<uint32_t>(MEM_HU(0, main_rng)) << 20) ^
+    named[rng_named_index] = (static_cast<uint32_t>(MEM_HU(0, main_rng)) << 20) ^
         (static_cast<uint32_t>(MEM_HU(0, secondary_rng)) << 8) ^ static_cast<uint16_t>(MEM_H(0, frame_counter));
+    if (netplay) {
+        uint32_t combined = 0x811c9dc5u;
+        for (uint32_t value : named) {
+            combined = (combined ^ value) * 0x01000193u;
+        }
+        sk1net::post_tick(combined);
+    }
+    if (!harness) {
+        return;
+    }
+
+    TickRecord& rec = state.current;
+    std::memcpy(rec.named, named, sizeof(named));
     for (uint32_t b = 0; b < block_count; b++) {
         rec.blocks[b] = hash_rdram_block(rdram, b * block_size);
     }
