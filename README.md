@@ -56,8 +56,8 @@ Bluetooth and USB controllers work too, and the D-pad also steers, so D-pad-only
 - Mods with native code are not supported on Android.
 - Releases are signed with the same key, so each update installs over the previous version. Each release lists the
   APK's SHA-256 checksum and the signing certificate fingerprint so you can verify your download.
-- This port fixed a Vulkan synchronisation bug in Plume (RT64's graphics layer) that corrupted textures on Mali GPUs;
-  the fix has been submitted upstream as [renderbag/plume#138](https://github.com/renderbag/plume/pull/138).
+- This port patches a Vulkan synchronisation bug in Plume (RT64's graphics layer) that corrupted textures on Mali
+  GPUs; the fix is in `android/patches/rt64-plume.patch`.
 
 ## Building the Android Port
 
