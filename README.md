@@ -1,10 +1,10 @@
 # Snowboard Kids: Recompiled for Android
 
-An Android port of [Snowboard Kids: Recompiled](https://github.com/cdlewis/snowboardkids-recomp) by cdlewis, which uses [N64: Recompiled](https://github.com/Mr-Wiseguy/N64Recomp) to **statically recompile** Snowboard Kids into a native game, rendered with [RT64](https://github.com/rt64/rt64). This port runs it natively on Android phones and tablets, with on-screen touch controls and controller support.
+An Android port of [Snowboard Kids: Recompiled](https://github.com/cdlewis/snowboardkids-recomp) by cdlewis, which uses [N64: Recompiled](https://github.com/Mr-Wiseguy/N64Recomp) to **statically recompile** Snowboard Kids into a native game, rendered with [RT64](https://github.com/rt64/rt64). This port runs it natively on Android phones and tablets, with on-screen touch controls, controller support and local-network multiplayer (netplay) between phones and PCs.
 
 ### [Download the latest Android APK](https://github.com/rbriney/snowboardkids-recomp/releases/latest)
 
-Playing on Windows, macOS or Linux? Get those versions from the [original project's releases](https://github.com/cdlewis/snowboardkids-recomp/releases/latest).
+Playing on Windows, macOS or Linux? Get those versions from the [original project's releases](https://github.com/cdlewis/snowboardkids-recomp/releases/latest). To play netplay against the Android version from a PC, use the Windows build (`SnowboardKidsRecompiled-Windows.zip`) in [this project's releases](https://github.com/rbriney/snowboardkids-recomp/releases/latest).
 
 ### **This repository and its releases do not contain game assets. You need your own copy of the North American (US) N64 release of Snowboard Kids.**
 
@@ -17,6 +17,7 @@ Join the [Snowboard Kids Community Discord](https://discord.gg/PJzG4F8SpF) to di
 - [Installing](#installing)
 - [Requirements](#requirements)
 - [Controls](#controls)
+- [Netplay](#netplay)
 - [Android Notes](#android-notes)
 - [Building the Android Port](#building-the-android-port)
 - [About Snowboard Kids: Recompiled](#about-snowboard-kids-recompiled)
@@ -48,6 +49,21 @@ To update, install the newer APK over the old one; your saves and settings are k
 On-screen touch controls (analog stick, A, B, Z, the C-buttons for board grabs, Start, and MENU for the settings menu) appear when the game
 starts. The button at the top centre hides or shows them; they start hidden if a controller is connected.
 Bluetooth and USB controllers work too, and the D-pad also steers, so D-pad-only controllers can be used.
+
+## Netplay
+
+Up to four players can race on separate phones or Windows PCs on the same network (experimental).
+
+1. Everyone needs the same release: the Android APK, or the Windows zip from the
+   [latest release](https://github.com/rbriney/snowboardkids-recomp/releases/latest), and the same US ROM.
+2. On one device choose **Netplay → Host a game**, pick how many players there are in total and on that device, and
+   tap **Host game**.
+3. On the others choose **Netplay → Join a game** and pick the game from the list (or type the host's address).
+   The race starts once everyone has joined.
+
+More than one player can share a device with extra controllers. If someone's connection drops, everyone's game pauses
+until all connected players press A, or the host presses Start to continue without them. Everyone plays with the
+host's save for the session. When hosting on a PC, Windows Firewall may ask to allow the game on private networks.
 
 ## Android Notes
 
