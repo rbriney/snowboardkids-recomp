@@ -24,7 +24,7 @@ import java.util.List;
  */
 public class SK1TouchControls extends View {
     // SDL_GameControllerButton values.
-    private static final int BTN_A = 0, BTN_X = 2, BTN_START = 6;
+    private static final int BTN_A = 0, BTN_X = 2, BTN_BACK = 4, BTN_START = 6;
     // SDL_GameControllerAxis values.
     private static final int AXIS_LEFTX = 0, AXIS_LEFTY = 1, AXIS_RIGHTX = 2, AXIS_RIGHTY = 3, AXIS_TRIGGERLEFT = 4;
 
@@ -88,6 +88,8 @@ public class SK1TouchControls extends View {
         controls.add(axisControl("C▶", AXIS_RIGHTX, 32767, cX + cOffX, cY, cR));
         // Centre bottom: Start.
         controls.add(new Control(Kind.BUTTON, "START", BTN_START, 0.50f, 0.92f, 0.055f, true));
+        // Top, left of the toggle: the controller Back button, which opens the recomp's settings menu.
+        controls.add(new Control(Kind.BUTTON, "MENU", BTN_BACK, 0.40f, 0.06f, 0.04f, true));
         // Top centre: hide/show toggle (always visible).
         toggle = new Control(Kind.TOGGLE, "", -1, 0.50f, 0.06f, 0.045f, false);
 

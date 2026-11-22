@@ -45,7 +45,7 @@ To update, install the newer APK over the old one; your saves and settings are k
 
 ## Controls
 
-On-screen touch controls (analog stick, A, B, Z, the C-buttons for board grabs, and Start) appear when the game
+On-screen touch controls (analog stick, A, B, Z, the C-buttons for board grabs, Start, and MENU for the settings menu) appear when the game
 starts. The button at the top centre hides or shows them; they start hidden if a controller is connected.
 Bluetooth and USB controllers work too, and the D-pad also steers, so D-pad-only controllers can be used.
 
