@@ -64,6 +64,7 @@
 #endif
 
 #include "recomp.h"
+#include "librecomp/helpers.hpp"
 #include "recompinput/players.h"
 #include "ultramodern/ultramodern.hpp"
 #include "netplay.h"
@@ -100,7 +101,7 @@ constexpr uint32_t no_tick = 0xFFFFFFFFu;
 constexpr uint8_t host_id = 0;
 constexpr uint8_t unassigned_id = 0xFF;
 constexpr uint8_t no_owner = 0xFF;
-constexpr auto peer_timeout = std::chrono::seconds(10);      // a joiner without the host gives up after this
+constexpr auto peer_timeout = std::chrono::seconds(60);      // a joiner without the host gives up after this
 constexpr auto pause_after = std::chrono::milliseconds(1500); // host pauses after waiting this long for a joiner
 constexpr auto disconnected_after = std::chrono::seconds(4);  // a silent joiner is shown as disconnected
 constexpr auto scripted_drop_after = std::chrono::seconds(3); // unattended tests: drop a disconnected joiner
@@ -903,11 +904,14 @@ void init() {
     }
 }
 
+void publish_status();
+
 void end_session(const char* reason) {
     if (!session.ended) {
         session.ended = true;
         session.paused = false;
         session.waiting_for_host = false;
+        publish_status(); // hides the overlay and stops forced presents
         log_msg("session ended: %s", reason);
         notify_player(std::string("Netplay session ended: ") + reason +
                       ". The game continues offline; restart the games to play together again.");
@@ -1146,7 +1150,7 @@ void hold_while_paused(uint32_t needed_tick) {
                 log_msg("resumed: every connected player is ready");
             }
         } else if (now - session.last_host_receive > peer_timeout) {
-            end_session("no packets from the host for 10 seconds");
+            end_session("no packets from the host for 60 seconds");
         }
         if (now - last_send >= resend_interval) {
             last_send = now;
@@ -1169,6 +1173,15 @@ bool all_inputs_ready(uint32_t t) {
 }
 
 } // namespace
+
+// s32 recomp_get_netplay_view_port(void): with SK1_NET_OWN_VIEW=1 and one player on this device, the port this device
+// shows full screen in multiplayer races (patches/widescreen.c); otherwise -1 (normal split screen).
+extern "C" void recomp_get_netplay_view_port(uint8_t* rdram, recomp_context* ctx) {
+    static const bool enabled = env_uint("SK1_NET_OWN_VIEW", 0, 1, 0) != 0;
+    const bool own_view = enabled && session.enabled && session.started && !session.ended &&
+        session.local_players == 1;
+    _return<s32>(ctx, own_view ? static_cast<s32>(session.first_port) : -1);
+}
 
 sk1net::OverlayStatus sk1net::overlay_status() {
     std::lock_guard lock{ session.status_mutex };
@@ -1242,7 +1255,7 @@ void sk1net::pre_tick(uint8_t* rdram, gpr inputs) {
                 publish_status();
             }
             if (now - session.last_host_receive > peer_timeout) {
-                end_session("no packets from the host for 10 seconds");
+                end_session("no packets from the host for 60 seconds");
                 return;
             }
         }

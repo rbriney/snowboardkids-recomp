@@ -47,11 +47,13 @@ static void runGameTick(void) {
     s8 rawStickX;
     s8 rawStickY;
 
-    // @recomp While the harness or netplay is active, finish every frame still being drawn before the tick runs and
-    // apply its completion here (exactly as gameThreadMain's messages 5 and 6 do). Scene transitions wait for
-    // gPendingFramebufferSwapCount to return to 2, and how many ticks that took depended on the host GPU; now it is
-    // always 2 at the start of a tick, so every machine sees the same value.
-    if (recomp_det_sync_render()) {
+    // @recomp While the harness or netplay is active, scene transitions must not depend on GPU speed. Each one sets
+    // gFramebufferSwapHold (no new frames are submitted), then waits in a later tick for gPendingFramebufferSwapCount
+    // to return to 2. While the hold is set, finish every frame still being drawn before the tick runs and apply its
+    // completion here (exactly as gameThreadMain's messages 5 and 6 do), so the count is always 2 by then on every
+    // machine. Outside transitions the count only decides whether a frame is drawn, so ticks never wait for the GPU
+    // (waiting every tick slowed the game, and its music, on slower phones).
+    if (recomp_det_sync_render() && gFramebufferSwapHold != 0) {
         OSMesg doneMessage;
         while (gPendingFramebufferSwapCount < 2) {
             osRecvMesg(&gFramebufferRenderDoneQueue, &doneMessage, OS_MESG_BLOCK);

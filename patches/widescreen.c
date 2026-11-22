@@ -6,6 +6,7 @@
 #include "game/race/camera/race_camera.h"
 #include "game/race/player/race_player_input.h"
 #include "game/race/flow/race_flow.h"
+#include "game/race/race_state.h"
 #include "race_split_screen.h"
 #include "podium_scene.h"
 #include "training_viewport.h"
@@ -13,6 +14,8 @@
 #include "game/menu/main_menu/main_menu_race_flow.h"
 
 extern s32 recomp_get_vertical_2p_split_screen_enabled(void);
+// Netplay own view (src/game/netplay.cpp): the port whose player this device shows full screen, or -1.
+extern s32 recomp_get_netplay_view_port(void);
 static s32 sVerticalTwoPlayerSplit;
 
 s32 raceUsesVerticalTwoPlayerSplit(void) {
@@ -117,6 +120,44 @@ static void snapViewportBoundsToScreenEdges(ViewportState *viewport) {
     viewport->viewport.vp.vtrans[1] = ((viewport->top + viewport->bottom) / 2) * 4;
 }
 
+// @recomp Netplay own view: in a multiplayer race's split-screen layout, give this device's player the whole screen
+// (the one-player race layout) and move the other views off screen so they are not drawn. Only the viewport's
+// rectangle and projection change; game logic does not read them, which the determinism harness checks.
+// Returns 1 when the arguments were replaced (the caller then skips the split-direction adjustment).
+static s32 applyNetplayOwnView(s32 index, s32 *x, s32 *y, u16 *width, u16 *height, u16 *scaleX, u16 *scaleY,
+                               f32 *aspect) {
+    s32 viewPort;
+
+    // Never in the title/menu demo races (they use a 4-player layout and their logic reads the viewports).
+    if (gRaceDemoPlaybackEnabled || gPlayerCount < 2 || index >= gPlayerCount) {
+        return 0;
+    }
+    // Only split layouts (a view smaller than the one-player race view) are replaced.
+    if (*width >= 0x120 && *height >= 0xC0) {
+        return 0;
+    }
+    viewPort = recomp_get_netplay_view_port();
+    if (viewPort < 0) {
+        return 0;
+    }
+    if (index == viewPort) {
+        *x = 0xA0;
+        *y = 0x78;
+        *width = 0x120;
+        *height = 0xD0;
+        *scaleX = 0x140;
+        *scaleY = 0xF0;
+        *aspect = 1.3333334f;
+    } else {
+        // Entirely off screen: configureViewport marks it invalid, so it is not drawn.
+        *x = -0x400;
+        *y = -0x400;
+        *width = 0x10;
+        *height = 0x10;
+    }
+    return 1;
+}
+
 RECOMP_PATCH void configureViewport(
     s32 viewportIndex,
     s32 centerX,
@@ -127,8 +168,11 @@ RECOMP_PATCH void configureViewport(
     u16 scaleY,
     f32 aspect
 ) {
-    f32 fov = configureRaceSplitDirection(viewportIndex, &centerX, &centerY, &width, &height,
-                                         &scaleX, &scaleY, &aspect);
+    f32 fov = 70.0f;
+    if (!applyNetplayOwnView(viewportIndex, &centerX, &centerY, &width, &height, &scaleX, &scaleY, &aspect)) {
+        fov = configureRaceSplitDirection(viewportIndex, &centerX, &centerY, &width, &height, &scaleX, &scaleY,
+                                          &aspect);
+    }
     f32 trainingProgress = configureTrainingViewportTransition(viewportIndex);
     if (viewportIndex == 0) {
         sTrainingViewportTransitionProgress = trainingProgress;

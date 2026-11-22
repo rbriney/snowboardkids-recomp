@@ -40,6 +40,7 @@ recomp_det_pre_tick = 0x8F00011C;
 recomp_det_post_tick = 0x8F000120;
 recomp_det_sync_render = 0x8F000124;
 recomp_det_ticks_per_update = 0x8F000128;
+recomp_get_netplay_view_port = 0x8F00012C;
 sqrtf_recomp = 0x8F0000B8;
 
 /* librecomp / ultramodern reimplementations. Only libultra functions that are

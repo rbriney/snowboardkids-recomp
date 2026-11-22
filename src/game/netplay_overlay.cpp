@@ -26,6 +26,10 @@ struct Overlay {
 void create_overlay() {
     using namespace recompui;
     overlay.context = create_context();
+    // Leave the controllers to the game: netplay reads A (ready) and Start (continue without) itself, and an
+    // input-capturing context would hide those presses from it.
+    overlay.context.set_captures_input(false);
+    overlay.context.set_captures_mouse(false);
     overlay.context.open();
     Element* root = overlay.context.get_root_element();
 
@@ -115,7 +119,7 @@ void frame_hook() {
             footer += " Host: press Start to continue without the disconnected players.";
         }
     } else {
-        footer = "The game will continue as soon as the host's connection recovers.";
+        footer = "The game will continue as soon as the host's connection recovers (up to a minute).";
     }
     overlay.footer->set_text(footer);
     overlay.context.close();

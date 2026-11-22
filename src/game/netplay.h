@@ -17,6 +17,8 @@
 //   SK1_NET_PLAYERS=<2-4>            host only: total players in the session (default: host's players + 1); the
 //                                    session starts once that many have joined
 //   SK1_NET_DELAY=<ticks>            host only: input delay (default 3 ticks = 100 ms)
+//   SK1_NET_OWN_VIEW=1               with one player on this device, show only that player's view, full screen,
+//                                    in multiplayer races instead of the split screen
 //
 // During a session both machines use an in-memory copy of the host's save, so neither real save file changes.
 //
