@@ -42,6 +42,9 @@ namespace sk1net {
     struct OverlayStatus {
         bool visible = false;
         bool paused = false; // session-wide pause (otherwise: this machine waiting for the host)
+        bool waiting_to_start = false; // before the first tick: host waiting for players, or joiner connecting
+        uint32_t players_joined = 0;   // host, before the start
+        std::string address;           // host: this device's address and port; joiner: the host's
         bool am_host = false;
         bool can_continue_without = false; // a player is disconnected; the host may drop them
         uint32_t total_ports = 0;
@@ -49,7 +52,26 @@ namespace sk1net {
     };
     OverlayStatus overlay_status();
 
+    // This device's address on the local network (the one other devices would use to reach it), or "" if unknown.
+    std::string local_address();
+
+    // A game being hosted on the local network, found by LAN discovery.
+    struct DiscoveredHost {
+        std::string address; // "a.b.c.d:port"
+        uint32_t players_joined = 0;
+        uint32_t total_players = 0;
+    };
+    // Broadcasts discovery requests on the local network and collects replies from hosts that are waiting for
+    // players. Runs on its own thread until stop_discovery(); discovered_hosts() returns the hosts heard from in the
+    // last few seconds.
+    void start_discovery(uint16_t port);
+    void stop_discovery();
+    std::vector<DiscoveredHost> discovered_hosts();
+
     bool active();
+    // Which local controller should rumble for a game port: the port itself without netplay; during netplay the
+    // local player index if that port's player is on this device, otherwise -1 (someone else's rumble).
+    int local_player_for_port(int port);
     // Called at the start of each game tick with the game's ControllerInputState[4] array. Blocks until every
     // player's input for this tick has arrived, then writes all four ports.
     void pre_tick(uint8_t* rdram, gpr inputs);

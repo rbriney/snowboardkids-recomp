@@ -32,6 +32,7 @@
 #include "ultramodern/ultramodern.hpp"
 #include "determinism_harness.h"
 #include "netplay.h"
+#include "perf_stats.h"
 
 #ifdef __ANDROID__
 #include <android/log.h>
@@ -77,6 +78,9 @@ struct BlockStats {
 struct State {
     Mode mode = Mode::Off;
     bool initialised = false;
+    // Hash all of RDRAM in 64 KB blocks each tick. Costly on phones (8 MB per tick), so automatic netplay recordings
+    // keep only the inputs and the named state hashes; explicit recordings and replays keep the blocks.
+    bool hash_blocks = true;
     std::filesystem::path path;
     FILE* record_file = nullptr;
     std::vector<TickRecord> replay;
@@ -201,8 +205,11 @@ void init() {
         std::strftime(stamp, sizeof(stamp), "%Y%m%d-%H%M%S", std::localtime(&now));
         const bool hosting = std::getenv("SK1_NET_HOST") != nullptr && *std::getenv("SK1_NET_HOST") != '\0';
         state.path = folder / (std::string(hosting ? "host-" : "join-") + stamp + ".bin");
+        state.hash_blocks = false;
         state.record_file = std::fopen(state.path.string().c_str(), "wb");
         if (state.record_file != nullptr) {
+            // Large buffer: on Android this folder is on shared storage, where frequent small writes stall the game.
+            std::setvbuf(state.record_file, nullptr, _IOFBF, 1 << 20);
             state.mode = Mode::Record;
             std::fwrite(file_magic, 1, sizeof(file_magic), state.record_file);
             log_line("recording this netplay session to %s", state.path.string());
@@ -371,6 +378,7 @@ bool sk1det::save_write(uint8_t* rdram, gpr src, uint32_t offset, uint32_t size)
 // s32 recomp_det_sync_render(void): nonzero while the harness or netplay is active, telling the tick patch to finish
 // outstanding frames before each tick so renderer timing cannot change game state.
 extern "C" void recomp_det_sync_render(uint8_t* rdram, recomp_context* ctx) {
+    sk1perf::tick_begin(); // called at the very start of every tick (performance diagnostics)
     _return<s32>(ctx, (sk1det::active() || sk1net::active()) ? 1 : 0);
 }
 
@@ -387,6 +395,7 @@ extern "C" void recomp_det_ticks_per_update(uint8_t* rdram, recomp_context* ctx)
 
 // void recomp_det_pre_tick(ControllerInputState* inputs, u8* connectedMask)
 extern "C" void recomp_det_pre_tick(uint8_t* rdram, recomp_context* ctx) {
+    sk1perf::tick_render_wait_done();
     // Netplay supplies the inputs first, so a netplay session can also be recorded by the harness.
     sk1net::pre_tick(rdram, ctx->r4);
     if (!sk1det::active()) {
@@ -462,7 +471,7 @@ extern "C" void recomp_det_post_tick(uint8_t* rdram, recomp_context* ctx) {
     TickRecord& rec = state.current;
     std::memcpy(rec.named, named, sizeof(named));
     for (uint32_t b = 0; b < block_count; b++) {
-        rec.blocks[b] = hash_rdram_block(rdram, b * block_size);
+        rec.blocks[b] = state.hash_blocks ? hash_rdram_block(rdram, b * block_size) : 0;
     }
 
     if (state.snapshot_ticks.count(state.tick) != 0) {
@@ -485,7 +494,8 @@ extern "C" void recomp_det_post_tick(uint8_t* rdram, recomp_context* ctx) {
 
     if (state.mode == Mode::Record) {
         std::fwrite(&rec, sizeof(rec), 1, state.record_file);
-        if ((state.tick % 30) == 0) {
+        // Flush about once a minute (the stdio buffer holds the rest), never every tick.
+        if ((state.tick % 1800) == 0) {
             std::fflush(state.record_file);
         }
     } else if (state.mode == Mode::Replay && state.tick < state.replay.size() &&
@@ -502,7 +512,10 @@ extern "C" void recomp_det_post_tick(uint8_t* rdram, recomp_context* ctx) {
                 }
             }
         }
-        for (uint32_t b = 0; b < block_count; b++) {
+        // Recordings made without block hashes (automatic netplay recordings) store zeros: nothing to compare.
+        const bool recorded_blocks = std::any_of(std::begin(recorded.blocks), std::end(recorded.blocks),
+            [](uint32_t value) { return value != 0; });
+        for (uint32_t b = 0; recorded_blocks && b < block_count; b++) {
             if (rec.blocks[b] != recorded.blocks[b]) {
                 BlockStats& s = state.block_stats[b];
                 s.mismatches++;

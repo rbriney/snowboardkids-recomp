@@ -22,6 +22,7 @@
 // the host sends START (the port owners) and play begins.
 
 #include <algorithm>
+#include <atomic>
 #include <array>
 #include <chrono>
 #include <cstdarg>
@@ -110,7 +111,11 @@ constexpr auto hello_interval = std::chrono::milliseconds(200);
 constexpr uint32_t stats_interval = 900; // 30 seconds of game time
 static_assert(chunk_count == 32);
 
-enum PacketType : uint8_t { Hello = 1, Welcome = 2, SaveChunk = 3, Ready = 4, Start = 5, Input = 6, Full = 7 };
+enum PacketType : uint8_t {
+    Hello = 1, Welcome = 2, SaveChunk = 3, Ready = 4, Start = 5, Input = 6, Full = 7,
+    Discover = 8, // LAN discovery: anyone -> broadcast
+    HostInfo = 9, // LAN discovery: a waiting host -> the asker
+};
 
 #pragma pack(push, 1)
 struct Header {
@@ -139,6 +144,12 @@ struct SaveChunkPacket {
     uint8_t index;
     uint8_t padding[3];
     uint8_t data[chunk_size];
+};
+struct HostInfoPacket {
+    Header header;
+    uint16_t port;
+    uint8_t players_joined;
+    uint8_t total_players;
 };
 struct StartPacket {
     Header header;
@@ -231,6 +242,8 @@ struct Session {
     std::array<uint32_t, port_count> host_acks{}; // joiner: the host holds every input below host_acks[p]
     std::array<Client, max_clients> clients{};
     uint8_t next_free_port = 0;
+    uint16_t local_port = 0;
+    std::string local_address_text; // host: "a.b.c.d:port" for the waiting screen
 
     std::mutex save_mutex;
     std::vector<uint8_t> save;
@@ -568,7 +581,6 @@ void send_start(const sockaddr_in& to) {
 
 void start_session() {
     session.started = true;
-    sk1net_overlay::install();
     std::string layout;
     for (uint32_t p = 0; p < session.total_ports; p++) {
         layout += " P" + std::to_string(p + 1) + "=" +
@@ -725,6 +737,18 @@ void process_packet(const uint8_t* data, size_t size, const sockaddr_in& from) {
         }
         return;
     }
+    if (h.type == Discover) {
+        // Only a host that is still waiting for players advertises itself.
+        if (session.is_host && !session.started) {
+            HostInfoPacket info{};
+            fill_header(info.header, HostInfo);
+            info.port = session.local_port;
+            info.players_joined = session.next_free_port;
+            info.total_players = session.total_ports;
+            send_now(from, &info, sizeof(info));
+        }
+        return;
+    }
     if (session.is_host) {
         host_process(data, size, h, from);
     } else {
@@ -839,6 +863,7 @@ void init() {
         session.my_id = host_id;
         session.first_port = 0;
         local.sin_port = htons(static_cast<uint16_t>(std::atoi(host)));
+        session.local_port = static_cast<uint16_t>(std::atoi(host));
         session.delay = env_uint("SK1_NET_DELAY", 1, 30, 3);
         const uint32_t minimum = std::min<uint32_t>(session.local_players + 1, port_count);
         session.total_ports = static_cast<uint8_t>(env_uint("SK1_NET_PLAYERS", minimum, port_count, minimum));
@@ -897,6 +922,10 @@ void init() {
     }
     session.enabled = true;
     if (hosting) {
+        session.local_address_text = sk1net::local_address() + ":" + std::to_string(session.local_port);
+    }
+    sk1net_overlay::install();
+    if (hosting) {
         log_msg("hosting on UDP port %u with %u local player(s); waiting for %u more player(s)",
             ntohs(local.sin_port), session.local_players, session.total_ports - session.local_players);
     } else {
@@ -949,6 +978,8 @@ void fill_dropped_ports(uint32_t until) {
     }
 }
 
+void publish_status();
+
 // Blocks the game thread until the handshake completes (at the first game tick).
 void wait_for_start() {
     if (session.is_host) {
@@ -1000,6 +1031,11 @@ void wait_for_start() {
                 send_to(session.host_address, &p, sizeof(p));
             }
         }
+        static auto last_publish = clock_type::time_point{};
+        if (now - last_publish >= std::chrono::milliseconds(250)) {
+            last_publish = now;
+            publish_status();
+        }
         if (now - last_log >= std::chrono::seconds(5)) {
             last_log = now;
             if (session.is_host) {
@@ -1015,13 +1051,22 @@ void wait_for_start() {
     for (Client& client : session.clients) {
         client.last_receive = now;
     }
+    publish_status();
 }
 
 // Copies the state the overlay needs into its mutex-protected snapshot (read on the UI thread).
 void publish_status() {
     sk1net::OverlayStatus status;
     status.paused = session.paused;
-    status.visible = session.started && !session.ended && (session.paused || session.waiting_for_host);
+    status.waiting_to_start = !session.started;
+    status.visible = session.enabled && !session.ended &&
+        (!session.started || session.paused || session.waiting_for_host);
+    status.players_joined = session.next_free_port;
+    if (session.is_host) {
+        status.address = session.local_address_text;
+    } else {
+        status.address = address_text(session.host_address);
+    }
     status.am_host = session.is_host;
     status.total_ports = session.total_ports;
     for (uint32_t p = 0; p < port_count; p++) {
@@ -1192,6 +1237,16 @@ sk1net::OverlayStatus sk1net::overlay_status() {
     return status;
 }
 
+int sk1net::local_player_for_port(int port) {
+    if (!session.enabled || !session.started || session.ended) {
+        return port;
+    }
+    if (port < 0 || !is_local_port(static_cast<uint32_t>(port))) {
+        return -1;
+    }
+    return port - session.first_port;
+}
+
 bool sk1net::active() {
     init();
     return session.enabled && !session.ended;
@@ -1354,4 +1409,166 @@ bool sk1net::save_write(uint8_t* rdram, gpr src, uint32_t offset, uint32_t size)
         session.save[offset + i] = MEM_B(i, src);
     }
     return true;
+}
+
+// ---- LAN discovery (lobby) and local address ----
+
+std::string sk1net::local_address() {
+    // Ask the OS which local address it would use to reach a public address. No packet is sent.
+#ifdef _WIN32
+    static bool wsa_ready = [] {
+        WSADATA wsa;
+        return WSAStartup(MAKEWORD(2, 2), &wsa) == 0;
+    }();
+    if (!wsa_ready) {
+        return "";
+    }
+#endif
+    socket_t s = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    if (s == invalid_socket) {
+        return "";
+    }
+    sockaddr_in target{};
+    target.sin_family = AF_INET;
+    target.sin_port = htons(53);
+    inet_pton(AF_INET, "8.8.8.8", &target.sin_addr);
+    std::string result;
+    if (connect(s, reinterpret_cast<const sockaddr*>(&target), sizeof(target)) == 0) {
+        sockaddr_in local{};
+        socklen_t length = sizeof(local);
+        if (getsockname(s, reinterpret_cast<sockaddr*>(&local), &length) == 0) {
+            char text[64];
+            inet_ntop(AF_INET, &local.sin_addr, text, sizeof(text));
+            result = text;
+        }
+    }
+#ifdef _WIN32
+    closesocket(s);
+#else
+    close(s);
+#endif
+    return result;
+}
+
+namespace {
+
+struct Discovery {
+    std::mutex mutex;
+    std::thread thread;
+    std::atomic<bool> running{ false };
+    struct Entry {
+        sk1net::DiscoveredHost host;
+        clock_type::time_point seen;
+    };
+    std::vector<Entry> hosts;
+} discovery;
+
+void discovery_thread(uint16_t port) {
+    socket_t s = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    if (s == invalid_socket || !set_non_blocking(s)) {
+        return;
+    }
+    int yes = 1;
+    setsockopt(s, SOL_SOCKET, SO_BROADCAST, reinterpret_cast<const char*>(&yes), sizeof(yes));
+    sockaddr_in local{};
+    local.sin_family = AF_INET;
+    local.sin_addr.s_addr = htonl(INADDR_ANY);
+    bind(s, reinterpret_cast<const sockaddr*>(&local), sizeof(local));
+
+    sockaddr_in broadcast{};
+    broadcast.sin_family = AF_INET;
+    broadcast.sin_port = htons(port);
+    broadcast.sin_addr.s_addr = htonl(INADDR_BROADCAST);
+    sockaddr_in loopback = broadcast; // a host on this same machine
+    inet_pton(AF_INET, "127.0.0.1", &loopback.sin_addr);
+
+    auto last_ask = clock_type::time_point{};
+    while (discovery.running) {
+        const auto now = clock_type::now();
+        if (now - last_ask >= std::chrono::seconds(1)) {
+            last_ask = now;
+            Header ask{};
+            ask.magic = packet_magic;
+            ask.version = protocol_version;
+            ask.type = Discover;
+            ask.sender = unassigned_id;
+            sendto(s, reinterpret_cast<const char*>(&ask), sizeof(ask), 0,
+                reinterpret_cast<const sockaddr*>(&broadcast), sizeof(broadcast));
+            sendto(s, reinterpret_cast<const char*>(&ask), sizeof(ask), 0,
+                reinterpret_cast<const sockaddr*>(&loopback), sizeof(loopback));
+        }
+        fd_set fds;
+        FD_ZERO(&fds);
+        FD_SET(s, &fds);
+        timeval tv{ 0, 100000 };
+        if (select(static_cast<int>(s) + 1, &fds, nullptr, nullptr, &tv) > 0) {
+            uint8_t buffer[256];
+            sockaddr_in from{};
+            socklen_t from_len = sizeof(from);
+            const int received = recvfrom(s, reinterpret_cast<char*>(buffer), sizeof(buffer), 0,
+                reinterpret_cast<sockaddr*>(&from), &from_len);
+            if (received >= static_cast<int>(sizeof(HostInfoPacket))) {
+                HostInfoPacket info;
+                std::memcpy(&info, buffer, sizeof(info));
+                if (info.header.magic == packet_magic && info.header.version == protocol_version &&
+                    info.header.type == HostInfo) {
+                    char text[64];
+                    inet_ntop(AF_INET, &from.sin_addr, text, sizeof(text));
+                    sk1net::DiscoveredHost host;
+                    host.address = std::string(text) + ":" + std::to_string(info.port);
+                    host.players_joined = info.players_joined;
+                    host.total_players = info.total_players;
+                    std::lock_guard lock{ discovery.mutex };
+                    auto it = std::find_if(discovery.hosts.begin(), discovery.hosts.end(),
+                        [&](const auto& e) { return e.host.address == host.address; });
+                    if (it != discovery.hosts.end()) {
+                        it->host = host;
+                        it->seen = clock_type::now();
+                    } else {
+                        discovery.hosts.push_back({ host, clock_type::now() });
+                    }
+                }
+            }
+        }
+    }
+#ifdef _WIN32
+    closesocket(s);
+#else
+    close(s);
+#endif
+}
+
+} // namespace
+
+void sk1net::start_discovery(uint16_t port) {
+    if (discovery.running) {
+        return;
+    }
+    sk1net::local_address(); // makes sure WSAStartup has run on Windows
+    discovery.running = true;
+    discovery.thread = std::thread(discovery_thread, port);
+}
+
+void sk1net::stop_discovery() {
+    if (!discovery.running) {
+        return;
+    }
+    discovery.running = false;
+    if (discovery.thread.joinable()) {
+        discovery.thread.join();
+    }
+    std::lock_guard lock{ discovery.mutex };
+    discovery.hosts.clear();
+}
+
+std::vector<sk1net::DiscoveredHost> sk1net::discovered_hosts() {
+    std::lock_guard lock{ discovery.mutex };
+    std::vector<sk1net::DiscoveredHost> result;
+    const auto now = clock_type::now();
+    for (const auto& entry : discovery.hosts) {
+        if (now - entry.seen < std::chrono::seconds(4)) {
+            result.push_back(entry.host);
+        }
+    }
+    return result;
 }

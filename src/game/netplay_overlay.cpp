@@ -11,6 +11,7 @@
 #include "elements/ui_label.h"
 #include "netplay.h"
 #include "netplay_overlay.h"
+#include "netplay_lobby.h"
 
 namespace {
 
@@ -90,6 +91,7 @@ std::string player_line(const sk1net::OverlayStatus& status, uint32_t port) {
 }
 
 void frame_hook() {
+    sk1net_lobby::frame_update();
     const sk1net::OverlayStatus status = sk1net::overlay_status();
     if (!status.visible) {
         if (overlay.shown) {
@@ -103,6 +105,28 @@ void frame_hook() {
     }
 
     overlay.context.open();
+    if (status.waiting_to_start) {
+        overlay.title->set_text(status.am_host ? "Hosting a netplay game" : "Joining a netplay game");
+        for (auto* line : overlay.players) {
+            line->set_display(recompui::Display::None);
+        }
+        overlay.players[0]->set_display(recompui::Display::Block);
+        if (status.am_host) {
+            overlay.players[0]->set_text("Players joined: " + std::to_string(status.players_joined) + " of " +
+                std::to_string(status.total_ports));
+            overlay.footer->set_text("Other players can find this game in Netplay > Join, or join " + status.address +
+                ". The race starts when everyone has joined.");
+        } else {
+            overlay.players[0]->set_text("Connecting to " + status.address + "...");
+            overlay.footer->set_text("Waiting for the host to start the game.");
+        }
+        overlay.context.close();
+        if (!overlay.shown) {
+            recompui::show_context(overlay.context, "");
+            overlay.shown = true;
+        }
+        return;
+    }
     overlay.title->set_text(status.paused ? "Netplay paused" : "Waiting for the host...");
     for (uint32_t port = 0; port < overlay.players.size(); port++) {
         if (port < status.total_ports) {

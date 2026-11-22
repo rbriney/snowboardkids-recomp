@@ -1,5 +1,6 @@
 #include "sk1_launcher.h"
 #include "game_regions.h"
+#include "../game/netplay_lobby.h"
 
 #include <cstdlib>
 #include <filesystem>
@@ -425,6 +426,8 @@ void on_launcher_init(recompui::LauncherMenu* menu) {
     context.set_autofocus_element(start_option);
     initial_focus_pending = true;
 
+    context.create_element<Sk1LauncherOption>(
+        menu_container, "Netplay", []() { sk1net_lobby::open([]() { start_or_select_rom(); }); }, false);
     context.create_element<Sk1LauncherOption>(
         menu_container, "Controls", []() { open_config_tab(recompui::config::controls::id); }, false);
     context.create_element<Sk1LauncherOption>(

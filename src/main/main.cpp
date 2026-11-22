@@ -12,6 +12,8 @@
 #include "nfd.h"
 
 #include "ultramodern/ultra64.h"
+#include "../game/perf_stats.h"
+#include "../game/netplay.h"
 #include "ultramodern/ultramodern.hpp"
 #define SDL_MAIN_HANDLED
 #ifdef _WIN32
@@ -369,14 +371,23 @@ void queue_samples(int16_t* audio_data, size_t sample_count) {
 
     uint64_t cur_queued_microseconds =
         uint64_t(SDL_GetQueuedAudioSize(audio_device)) / bytes_per_frame * 1000000 / sample_rate;
+    sk1perf::audio_queued(cur_queued_microseconds);
+    sk1perf::maybe_log();
     uint32_t num_bytes_to_queue =
         audio_convert.len_cvt - output_channels * discarded_output_frames * sizeof(swap_buffer[0]);
     float* samples_to_queue = swap_buffer.data() + output_channels * discarded_output_frames / 2;
 
     // Prevent audio latency from building up by skipping samples in incoming audio when too many samples are already
     // queued. Skip samples based on how many microseconds of samples are queued already.
+#if defined(__ANDROID__)
+    // Android's audio backends pull audio in large chunks, so the queue routinely swings past 100 ms; skipping then
+    // throws away half of the incoming audio and is heard as hitching. Only skip when latency is really building up.
+    uint32_t skip_factor = cur_queued_microseconds / 300000;
+#else
     uint32_t skip_factor = cur_queued_microseconds / 100000;
+#endif
     if (skip_factor != 0) {
+        sk1perf::audio_skipped();
         uint32_t skip_ratio = 1 << skip_factor;
         num_bytes_to_queue /= skip_ratio;
         for (size_t i = 0; i < num_bytes_to_queue / (output_channels * sizeof(swap_buffer[0])); i++) {
@@ -741,6 +752,15 @@ ultramodern::input::connected_device_info_t get_sk1_connected_device_info(int co
     };
 }
 
+// Rumble for a game port goes to the controller of the player in that port. During netplay that player may be on
+// another device (then nothing rumbles here) or be a different local player index.
+void set_sk1_rumble(int controller_num, bool on) {
+    const int local_player = sk1net::local_player_for_port(controller_num);
+    if (local_player >= 0) {
+        recompinput::set_rumble(local_player, on);
+    }
+}
+
 bool get_sk1_n64_input(int controller_num, uint16_t* buttons_out, float* x_out, float* y_out) {
     static const int mirrored_player_count = []() {
         const char* value = std::getenv("RECOMP_MIRROR_INPUTS");
@@ -960,7 +980,7 @@ int main(int argc, char** argv) {
     ultramodern::input::callbacks_t input_callbacks{
         .poll_input = recompinput::poll_inputs,
         .get_input = get_sk1_n64_input,
-        .set_rumble = recompinput::set_rumble,
+        .set_rumble = set_sk1_rumble,
         .get_connected_device_info = get_sk1_connected_device_info,
     };
 
