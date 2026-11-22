@@ -109,7 +109,8 @@ same build and ROM.
 
 In the launcher choose **Netplay**: the host picks how many players there are in total and on that device and taps
 **Host game**; the others choose **Join a game**, where games on the local network are listed automatically (or type
-the host's address). Choices are remembered in `netplay.cfg`. Sessions can also be configured without the lobby:
+the host's address). Each device can also choose to show only its own player full screen instead of the split
+screen. Choices are remembered in `netplay.cfg`. Sessions can also be configured without the lobby:
 
 - Android: put `netplay.txt` in the app's external files folder before starting the game:
   - host: `host 7777` (options: `delay=3`, `players=4` for the total in the session, `local=2` for players on

@@ -26,6 +26,7 @@
 #include "elements/ui_label.h"
 #include "elements/ui_radio.h"
 #include "elements/ui_text_input.h"
+#include "elements/ui_toggle.h"
 #include "util/file.h"
 #include "netplay.h"
 #include "netplay_lobby.h"
@@ -40,6 +41,7 @@ struct Settings {
     uint32_t total_players = 2; // host
     uint32_t local_players = 1;
     std::string join_address;   // last typed address
+    bool own_view = false;      // show only this device's player, full screen (one player on this device)
 };
 
 std::filesystem::path settings_path() {
@@ -63,6 +65,8 @@ Settings load_settings() {
             settings.local_players = std::clamp(std::atoi(value.c_str()), 1, 3);
         } else if (key == "address") {
             settings.join_address = value;
+        } else if (key == "ownview") {
+            settings.own_view = value == "1";
         }
     }
     return settings;
@@ -73,6 +77,7 @@ void save_settings(const Settings& settings) {
     out << "players=" << settings.total_players << "\n";
     out << "local=" << settings.local_players << "\n";
     out << "address=" << settings.join_address << "\n";
+    out << "ownview=" << (settings.own_view ? 1 : 0) << "\n";
 }
 
 void set_env(const char* name, const std::string& value) {
@@ -110,9 +115,13 @@ struct Lobby {
     std::array<std::string, max_listed_hosts> listed_addresses{};
     recompui::TextInput* address_input = nullptr;
     recompui::Radio* join_local_players = nullptr;
+    recompui::Toggle* host_own_view = nullptr;
+    recompui::Toggle* join_own_view = nullptr;
 } lobby;
 
 void start_with_env() {
+    // Own view only applies with a single player on this device (netplay ignores it otherwise).
+    set_env("SK1_NET_OWN_VIEW", lobby.settings.own_view ? "1" : "");
     save_settings(lobby.settings);
     sk1net::stop_discovery();
     sk1net_lobby::close();
@@ -150,6 +159,8 @@ void join_game(const std::string& address) {
 
 void show_page(Page page) {
     lobby.page = page;
+    lobby.host_own_view->set_checked(lobby.settings.own_view);
+    lobby.join_own_view->set_checked(lobby.settings.own_view);
     lobby.choose_page->set_display(page == Page::Choose ? recompui::Display::Flex : recompui::Display::None);
     lobby.host_page->set_display(page == Page::Host ? recompui::Display::Flex : recompui::Display::None);
     lobby.join_page->set_display(page == Page::Join ? recompui::Display::Flex : recompui::Display::None);
@@ -187,6 +198,20 @@ recompui::Element* make_row(recompui::Element* parent) {
     row->set_gap(16.0f);
     row->set_as_navigation_container(NavigationType::Horizontal);
     return row;
+}
+
+// "Show only my player" toggle; the host and join pages each have one, kept in step through the settings.
+recompui::Toggle* make_own_view_row(recompui::Element* parent) {
+    using namespace recompui;
+    Element* row = make_row(parent);
+    row->set_align_items(AlignItems::Center);
+    Toggle* toggle = lobby.context.create_element<Toggle>(row);
+    toggle->set_checked(lobby.settings.own_view);
+    toggle->add_checked_callback([](bool checked) { lobby.settings.own_view = checked; });
+    Label* label = lobby.context.create_element<Label>(row,
+        "Show only my player, full screen (with one player on this device)", LabelStyle::Normal);
+    label->set_white_space(WhiteSpace::Normal);
+    return toggle;
 }
 
 recompui::Radio* make_radio(recompui::Element* parent, const std::vector<std::string>& options, uint32_t index) {
@@ -247,6 +272,7 @@ void create_lobby() {
     lobby.total_players = make_radio(lobby.host_page, { "2", "3", "4" }, lobby.settings.total_players - 2);
     lobby.context.create_element<Label>(lobby.host_page, "Players on this device", LabelStyle::Large);
     lobby.host_local_players = make_radio(lobby.host_page, { "1", "2", "3" }, lobby.settings.local_players - 1);
+    lobby.host_own_view = make_own_view_row(lobby.host_page);
     lobby.host_address = lobby.context.create_element<Label>(lobby.host_page, "", LabelStyle::Normal);
     lobby.host_address->set_white_space(WhiteSpace::Normal);
     Element* host_actions = make_row(lobby.host_page);
@@ -283,6 +309,7 @@ void create_lobby() {
     join_address->add_pressed_callback([]() { join_game(lobby.settings.join_address); });
     lobby.context.create_element<Label>(lobby.join_page, "Players on this device", LabelStyle::Large);
     lobby.join_local_players = make_radio(lobby.join_page, { "1", "2", "3" }, lobby.settings.local_players - 1);
+    lobby.join_own_view = make_own_view_row(lobby.join_page);
     Button* join_back = lobby.context.create_element<Button>(lobby.join_page, "Back", ButtonStyle::Tertiary);
     join_back->add_pressed_callback([]() { show_page(Page::Choose); });
 

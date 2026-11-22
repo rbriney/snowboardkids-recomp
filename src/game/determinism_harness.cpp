@@ -243,6 +243,27 @@ uint32_t hash_words(uint8_t* rdram, gpr vaddr, uint32_t size) {
     return static_cast<uint32_t>(h ^ (h >> 32));
 }
 
+// A racer's state for netplay desync checks: the whole RacePlayer except its pointers into per-frame render scratch
+// memory: the shadow's vertex and matrix buffers (RacePlayerState+0x47C/0x480) and the 14 model-part matrices
+// (RacePlayerState+0x514..0x54B). Their addresses depend on how much is drawn each frame (for example with own view
+// hiding other players' viewports) and never affect gameplay.
+bool is_render_scratch_pointer(uint32_t racer_offset) {
+    constexpr uint32_t state = 0x1C;
+    return racer_offset == state + 0x47C || racer_offset == state + 0x480 ||
+        (racer_offset >= state + 0x514 && racer_offset < state + 0x54C);
+}
+
+uint32_t hash_racer_for_netplay(uint8_t* rdram, gpr vaddr) {
+    uint64_t h = 0xcbf29ce484222325ULL;
+    for (uint32_t offset = 0; offset < racer_size; offset += 4) {
+        if (is_render_scratch_pointer(offset)) {
+            continue;
+        }
+        h = (h ^ static_cast<uint32_t>(MEM_W(offset, vaddr))) * 0x100000001b3ULL;
+    }
+    return static_cast<uint32_t>(h ^ (h >> 32));
+}
+
 uint32_t hash_rdram_block(const uint8_t* rdram, uint32_t offset) {
     const uint64_t* words = reinterpret_cast<const uint64_t*>(rdram + offset);
     uint64_t h = 0xcbf29ce484222325ULL;
@@ -459,9 +480,10 @@ extern "C" void recomp_det_post_tick(uint8_t* rdram, recomp_context* ctx) {
         (static_cast<uint32_t>(MEM_HU(0, secondary_rng)) << 8) ^ static_cast<uint16_t>(MEM_H(0, frame_counter));
     if (netplay) {
         uint32_t combined = 0x811c9dc5u;
-        for (uint32_t value : named) {
-            combined = (combined ^ value) * 0x01000193u;
+        for (uint32_t i = 0; i < racer_count; i++) {
+            combined = (combined ^ hash_racer_for_netplay(rdram, players + i * racer_size)) * 0x01000193u;
         }
+        combined = (combined ^ named[rng_named_index]) * 0x01000193u;
         sk1net::post_tick(combined);
     }
     if (!harness) {

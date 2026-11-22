@@ -89,7 +89,7 @@ constexpr socket_t invalid_socket = -1;
 using clock_type = std::chrono::steady_clock;
 
 constexpr uint32_t packet_magic = 0x4E314B53; // "SK1N"
-constexpr uint16_t protocol_version = 3;
+constexpr uint16_t protocol_version = 4; // 4: desync hash ignores racer shadow-buffer pointers
 constexpr uint32_t save_size = 0x8000;
 constexpr uint32_t chunk_size = 1024;
 constexpr uint32_t chunk_count = save_size / chunk_size;

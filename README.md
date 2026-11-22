@@ -61,7 +61,7 @@ Up to four players can race on separate phones or Windows PCs on the same networ
 3. On the others choose **Netplay → Join a game** and pick the game from the list (or type the host's address).
    The race starts once everyone has joined.
 
-More than one player can share a device with extra controllers. If someone's connection drops, everyone's game pauses
+Each device can choose to show only its own player, full screen, instead of the split screen. More than one player can share a device with extra controllers. If someone's connection drops, everyone's game pauses
 until all connected players press A, or the host presses Start to continue without them. Everyone plays with the
 host's save for the session. When hosting on a PC, Windows Firewall may ask to allow the game on private networks.
 
