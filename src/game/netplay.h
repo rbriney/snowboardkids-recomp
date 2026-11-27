@@ -14,8 +14,8 @@
 //   SK1_NET_JOIN=<address>:<port>    join a host; takes the next free player slots
 //   SK1_NET_LOCAL_PLAYERS=<1-4>      players on this machine (default 1); with more than one, the controller
 //                                    assignment screen opens so each local player picks a controller
-//   SK1_NET_PLAYERS=<2-4>            host only: total players in the session (default: host's players + 1); the
-//                                    session starts once that many have joined
+//   SK1_NET_PLAYERS=<2-4>            host only: start automatically once this many players have joined (tests);
+//                                    otherwise up to four can join and the host presses Start to begin
 //   SK1_NET_DELAY=<ticks>            host only: input delay (default 3 ticks = 100 ms)
 //   SK1_NET_OWN_VIEW=1               with one player on this device, show only that player's view, full screen,
 //                                    in multiplayer races instead of the split screen
@@ -44,6 +44,8 @@ namespace sk1net {
         bool paused = false; // session-wide pause (otherwise: this machine waiting for the host)
         bool waiting_to_start = false; // before the first tick: host waiting for players, or joiner connecting
         bool host_away = false;        // joiner: the host has switched to another app
+        bool loading = false;          // started from the lobby: waiting for every device to finish loading the game
+        bool can_start = false;        // host, before the start: enough players have joined and all have the save
         uint32_t players_joined = 0;   // host, before the start
         std::string address;           // host: this device's address and port; joiner: the host's
         bool am_host = false;
@@ -68,6 +70,17 @@ namespace sk1net {
     void start_discovery(uint16_t port);
     void stop_discovery();
     std::vector<DiscoveredHost> discovered_hosts();
+
+    // Lobby sessions: the waiting room runs in the Netplay screen, before the game is launched. begin_lobby_session
+    // reads the SK1_NET_* settings and waits for players on a background thread; the lobby launches the game once
+    // lobby_state() says Started, and returns to its pages when it says Ended (finish_lobby_session() gives the
+    // reason). save_path is the host's save file (the game has not been started yet, so it cannot tell us).
+    enum class LobbyState { Waiting, Started, Ended };
+    bool begin_lobby_session(const std::string& save_path);
+    LobbyState lobby_state();
+    void lobby_request_start();  // host: start with the players who have joined
+    void lobby_request_cancel(); // host: cancel the game; joiner: leave it
+    std::string finish_lobby_session();
 
     bool active();
     // Which local controller should rumble for a game port: the port itself without netplay; during netplay the

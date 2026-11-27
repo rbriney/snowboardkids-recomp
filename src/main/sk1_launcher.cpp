@@ -427,7 +427,7 @@ void on_launcher_init(recompui::LauncherMenu* menu) {
     initial_focus_pending = true;
 
     context.create_element<Sk1LauncherOption>(
-        menu_container, "Netplay", []() { sk1net_lobby::open([]() { start_or_select_rom(); }); }, false);
+        menu_container, "Netplay", []() { sk1net_lobby::open(game_id, []() { start_or_select_rom(); }); }, false);
     context.create_element<Sk1LauncherOption>(
         menu_container, "Controls", []() { open_config_tab(recompui::config::controls::id); }, false);
     context.create_element<Sk1LauncherOption>(

@@ -108,6 +108,21 @@ void frame_hook() {
     }
 
     overlay.context.open();
+    if (status.loading) {
+        overlay.title->set_text("Starting the game");
+        for (auto* line : overlay.players) {
+            line->set_display(recompui::Display::None);
+        }
+        overlay.players[0]->set_display(recompui::Display::Block);
+        overlay.players[0]->set_text("Waiting for every player's game to finish loading...");
+        overlay.footer->set_text("");
+        overlay.context.close();
+        if (!overlay.shown) {
+            recompui::show_context(overlay.context, "");
+            overlay.shown = true;
+        }
+        return;
+    }
     if (status.waiting_to_start) {
         overlay.title->set_text(status.am_host ? "Hosting a netplay game" : "Joining a netplay game");
         for (auto* line : overlay.players) {
@@ -115,13 +130,15 @@ void frame_hook() {
         }
         overlay.players[0]->set_display(recompui::Display::Block);
         if (status.am_host) {
-            overlay.players[0]->set_text("Players joined: " + std::to_string(status.players_joined) + " of " +
-                std::to_string(status.total_ports));
-            overlay.footer->set_text("Other players can find this game in Netplay > Join, or join " + status.address +
-                ". The race starts when everyone has joined.");
+            overlay.players[0]->set_text("Players joined: " + std::to_string(status.players_joined) +
+                (status.players_joined >= 4 ? " (full)" : ""));
+            std::string footer = "Others can find this game in Netplay > Join, or join " + status.address + ". ";
+            footer += status.players_joined >= 2 ? "Press Start to begin with these players, or B to cancel."
+                                                 : "Press B to cancel.";
+            overlay.footer->set_text(footer);
         } else {
-            overlay.players[0]->set_text("Connecting to " + status.address + "...");
-            overlay.footer->set_text("Waiting for the host to start the game.");
+            overlay.players[0]->set_text("Connected to " + status.address);
+            overlay.footer->set_text("Waiting for the host to start the game. Press B to leave.");
         }
         overlay.context.close();
         if (!overlay.shown) {

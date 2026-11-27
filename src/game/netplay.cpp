@@ -33,6 +33,7 @@
 #include <filesystem>
 #include <fstream>
 #include <mutex>
+#include <new>
 #include <random>
 #include <string>
 #include <thread>
@@ -67,6 +68,7 @@
 #include "recomp.h"
 #include "librecomp/helpers.hpp"
 #include "recompinput/players.h"
+#include "recompinput/input_state.h"
 #include "ultramodern/ultramodern.hpp"
 #include "netplay.h"
 #include "determinism_harness.h"
@@ -89,7 +91,7 @@ constexpr socket_t invalid_socket = -1;
 using clock_type = std::chrono::steady_clock;
 
 constexpr uint32_t packet_magic = 0x4E314B53; // "SK1N"
-constexpr uint16_t protocol_version = 5; // 5: Away packets, no joiner timeout
+constexpr uint16_t protocol_version = 6; // 6: lobby waiting room (Leave, Loaded, Go)
 constexpr uint32_t save_size = 0x8000;
 constexpr uint32_t chunk_size = 1024;
 constexpr uint32_t chunk_count = save_size / chunk_size;
@@ -107,6 +109,12 @@ constexpr auto disconnected_after = std::chrono::seconds(4);  // a silent joiner
 constexpr auto scripted_drop_after = std::chrono::seconds(3); // unattended tests: drop a disconnected joiner
 constexpr auto resend_interval = std::chrono::milliseconds(15);
 constexpr auto hello_interval = std::chrono::milliseconds(200);
+constexpr auto waiting_room_timeout = std::chrono::seconds(5); // before the start: forget a joiner silent this long
+constexpr auto loading_timeout = std::chrono::seconds(90);     // lobby sessions: give up on a device that never loads
+// Lobby sessions: a device that has only just launched the game can take several seconds over its first frames
+// (e.g. Android setting up graphics). For this long after the start, waiting shows "Starting the game" instead of
+// pausing the session.
+constexpr auto startup_grace = std::chrono::seconds(30);
 constexpr uint32_t stats_interval = 900; // 30 seconds of game time
 static_assert(chunk_count == 32);
 
@@ -115,6 +123,9 @@ enum PacketType : uint8_t {
     Discover = 8, // LAN discovery: anyone -> broadcast
     HostInfo = 9, // LAN discovery: a waiting host -> the asker
     Away = 10,    // the sender's app is going into the background (Android); it will be silent until it returns
+    Leave = 11,   // before the start: a joiner leaves, or the host cancels the game
+    Loaded = 12,  // lobby sessions: a joiner has launched the game and reached its first tick
+    Go = 13,      // lobby sessions: the host -> joiners, everyone has loaded; play the first tick
 };
 
 #pragma pack(push, 1)
@@ -227,11 +238,19 @@ struct Client {
     uint32_t last_sequence = 0;
     bool away = false;           // sent Away and has not sent a newer INPUT packet since
     uint32_t away_sequence = 0;  // its INPUT sequence number when it went away
+    bool loaded = false;         // lobby sessions: has reached the first tick
 };
 
 struct Session {
     bool initialised = false;
     bool enabled = false;
+    bool lobby_mode = false;     // the waiting room runs in the Netplay screen; the game launches after the start
+    bool loading_done = false;   // lobby sessions: every device has loaded the game
+    bool go_received = false;    // lobby sessions, joiner: the host said everyone has loaded
+    std::string end_reason;      // lobby sessions: why the session ended, shown in the Netplay screen
+    std::string save_path;       // lobby sessions, host: the save file to share
+    clock_type::time_point grace_until{}; // lobby sessions: no pausing for slow devices before this
+    bool grace_stall = false;    // waiting for a slow device during the start-up grace period
     bool started = false;
     bool ended = false;
     bool is_host = false;
@@ -248,6 +267,7 @@ struct Session {
     std::array<uint32_t, port_count> host_acks{}; // joiner: the host holds every input below host_acks[p]
     std::array<Client, max_clients> clients{};
     uint8_t next_free_port = 0;
+    uint8_t auto_start_players = 0; // SK1_NET_PLAYERS: start by itself once this many have joined (tests)
     uint16_t local_port = 0;
     std::string local_address_text; // host: "a.b.c.d:port" for the waiting screen
 
@@ -303,6 +323,11 @@ struct Session {
     uint64_t packets_received = 0;
 } session;
 
+std::atomic<bool> lobby_start_requested{ false };
+std::atomic<bool> lobby_cancel_requested{ false };
+std::atomic<int> lobby_state_value{ 0 }; // sk1net::LobbyState
+std::thread lobby_thread;
+
 void log_msg(const char* fmt, ...) {
     char buffer[512];
     va_list args;
@@ -324,6 +349,10 @@ void log_msg(const char* fmt, ...) {
 // (unattended) runs, where nobody could dismiss it.
 void notify_player(const std::string& message) {
     if (session.scripted) {
+        return;
+    }
+    if (session.lobby_mode && !session.started) {
+        session.end_reason = message;
         return;
     }
     std::thread([message] {
@@ -351,8 +380,14 @@ uint32_t input_sequence(const uint8_t* data, size_t size, const Header& h) {
     return sequence;
 }
 
+constexpr uint16_t n64_button_a = 0x8000;
+constexpr uint16_t n64_button_b = 0x4000;
+constexpr uint16_t n64_button_start = 0x1000;
+
 // Defined further down.
 void publish_status();
+bool local_button_pressed(uint32_t local_index, uint16_t mask);
+void end_session(const char* reason);
 int SDLCALL app_event_watch(void*, SDL_Event* event);
 
 void fill_header(Header& h, PacketType type) {
@@ -601,6 +636,38 @@ void send_start(const sockaddr_in& to) {
     send_to(to, &s, sizeof(s));
 }
 
+// Before the start: forget a joiner and give the later joiners' players the freed ports, so the ports stay
+// contiguous. Joiners learn their final ports from the START packet.
+void remove_client(uint8_t index, const char* why) {
+    session.clients[index] = Client{};
+    session.owners.fill(no_owner);
+    for (uint32_t i = 0; i < session.local_players; i++) {
+        session.owners[i] = host_id;
+    }
+    uint8_t port = session.local_players;
+    for (uint8_t c = 0; c < max_clients; c++) {
+        Client& client = session.clients[c];
+        if (!client.used) {
+            continue;
+        }
+        client.first_port = port;
+        for (uint32_t i = 0; i < client.local_players; i++) {
+            session.owners[port++] = uint8_t(c + 1);
+        }
+    }
+    session.next_free_port = port;
+    log_msg("joiner %u %s; %u player(s) now", index + 1, why, session.next_free_port);
+}
+
+// Sends a few copies of a LEAVE packet (no acknowledgement: the sender is about to stop listening).
+void send_leave(const sockaddr_in& to) {
+    Header leave;
+    fill_header(leave, Leave);
+    for (int i = 0; i < 3; i++) {
+        send_to(to, &leave, sizeof(leave));
+    }
+}
+
 void start_session() {
     session.started = true;
     std::string layout;
@@ -682,6 +749,23 @@ void host_process(const uint8_t* data, size_t size, const Header& h, const socka
         log_msg("joiner %d is back", index + 1);
     }
     switch (h.type) {
+        case Leave:
+            if (!session.started) {
+                remove_client(uint8_t(index), "left");
+                publish_status();
+            }
+            break;
+        case Loaded:
+            if (session.started && !client.loaded) {
+                client.loaded = true;
+                log_msg("joiner %d has loaded the game", index + 1);
+            }
+            if (session.loading_done) {
+                Header go;
+                fill_header(go, Go);
+                send_to(client.address, &go, sizeof(go));
+            }
+            break;
         case Ready:
             if (!client.ready) {
                 client.ready = true;
@@ -755,6 +839,13 @@ void joiner_process(const uint8_t* data, size_t size, const Header& h, const soc
                 std::memcpy(&p, data, sizeof(p));
                 session.total_ports = std::clamp<uint8_t>(p.total_ports, 2, port_count);
                 std::memcpy(session.owners.data(), p.owners, port_count);
+                // Ports may have moved up since the WELCOME (an earlier joiner left).
+                for (uint8_t port = 0; port < port_count; port++) {
+                    if (session.owners[port] == session.my_id) {
+                        session.first_port = port;
+                        break;
+                    }
+                }
                 start_session();
             }
             break;
@@ -762,6 +853,14 @@ void joiner_process(const uint8_t* data, size_t size, const Header& h, const soc
             if (session.started) {
                 handle_input(data, size, h.sender);
             }
+            break;
+        case Leave:
+            if (!session.started && !session.ended) {
+                end_session("the host cancelled the game");
+            }
+            break;
+        case Go:
+            session.go_received = true;
             break;
         case Full:
             if (!session.welcomed && !session.ended) {
@@ -919,8 +1018,11 @@ void init() {
         local.sin_port = htons(static_cast<uint16_t>(std::atoi(host)));
         session.local_port = static_cast<uint16_t>(std::atoi(host));
         session.delay = env_uint("SK1_NET_DELAY", 1, 30, 3);
+        // Up to four players can join. The host starts the game (Start) with whoever has joined; unattended tests
+        // can instead start automatically once SK1_NET_PLAYERS players have joined.
+        session.total_ports = static_cast<uint8_t>(port_count);
         const uint32_t minimum = std::min<uint32_t>(session.local_players + 1, port_count);
-        session.total_ports = static_cast<uint8_t>(env_uint("SK1_NET_PLAYERS", minimum, port_count, minimum));
+        session.auto_start_players = static_cast<uint8_t>(env_uint("SK1_NET_PLAYERS", minimum, port_count, 0));
         for (uint32_t i = 0; i < session.local_players; i++) {
             session.owners[i] = host_id;
         }
@@ -981,8 +1083,8 @@ void init() {
     }
     sk1net_overlay::install();
     if (hosting) {
-        log_msg("hosting on UDP port %u with %u local player(s); waiting for %u more player(s)",
-            ntohs(local.sin_port), session.local_players, session.total_ports - session.local_players);
+        log_msg("hosting on UDP port %u with %u local player(s); up to %u more can join",
+            ntohs(local.sin_port), session.local_players, port_count - session.local_players);
     } else {
         log_msg("joining %s with %u local player(s)", join, session.local_players);
     }
@@ -997,6 +1099,10 @@ void end_session(const char* reason) {
         session.waiting_for_host = false;
         publish_status(); // hides the overlay and stops forced presents
         log_msg("session ended: %s", reason);
+        if (session.lobby_mode && !session.started) {
+            session.end_reason = reason;
+            return;
+        }
         notify_player(std::string("Netplay session ended: ") + reason +
                       ". The game continues offline; restart the games to play together again.");
     }
@@ -1083,7 +1189,9 @@ void wait_for_start() {
             std::lock_guard lock{ session.save_mutex };
             session.save = recorded;
         } else {
-            std::ifstream in(ultramodern::get_save_file_path(), std::ios::binary);
+            std::ifstream in(session.lobby_mode ? std::filesystem::u8path(session.save_path)
+                                                : ultramodern::get_save_file_path(),
+                std::ios::binary);
             if (in) {
                 std::lock_guard lock{ session.save_mutex };
                 in.read(reinterpret_cast<char*>(session.save.data()), save_size);
@@ -1093,16 +1201,50 @@ void wait_for_start() {
     }
     auto last_send = clock_type::time_point{};
     auto last_log = clock_type::now();
+    session.a_was_down.fill(true); // buttons held when the wait begins (e.g. from the lobby) do not count
     while (!session.started && !session.ended) {
         const auto now = clock_type::now();
+        // In the lobby the Netplay screen's buttons start or cancel. Otherwise (the game launched straight into
+        // netplay) the controllers do: before the first tick the game is not polling them yet, so refresh the input
+        // state ourselves. Mid-game the game's own polling does this.
+        bool start_pressed = false;
+        bool cancel_pressed = false;
+        if (session.lobby_mode) {
+            start_pressed = lobby_start_requested.exchange(false);
+            cancel_pressed = lobby_cancel_requested.exchange(false);
+        } else {
+            recompinput::poll_inputs();
+            start_pressed = local_button_pressed(0, n64_button_start);
+            cancel_pressed = local_button_pressed(0, n64_button_b);
+        }
         if (session.is_host) {
-            bool all_ready = session.next_free_port == session.total_ports;
-            for (const Client& client : session.clients) {
-                if (client.used && !client.ready) {
-                    all_ready = false;
+            for (uint8_t c = 0; c < max_clients; c++) {
+                if (session.clients[c].used && now - session.clients[c].last_receive > waiting_room_timeout) {
+                    remove_client(c, "stopped answering");
                 }
             }
-            if (all_ready) {
+            bool joiners_ready = true;
+            for (const Client& client : session.clients) {
+                if (client.used && !client.ready) {
+                    joiners_ready = false; // still receiving the save
+                }
+            }
+            const bool enough_players = session.next_free_port >= 2;
+            const bool host_starts = start_pressed;
+            const bool auto_start = session.auto_start_players != 0 &&
+                session.next_free_port >= session.auto_start_players;
+            if (cancel_pressed) {
+                for (const Client& client : session.clients) {
+                    if (client.used) {
+                        send_leave(client.address);
+                    }
+                }
+                end_session("hosting cancelled");
+                break;
+            }
+            if (enough_players && joiners_ready && (host_starts || auto_start)) {
+                // The session has exactly the players who joined; nobody can join once it has started.
+                session.total_ports = session.next_free_port;
                 start_session();
                 for (const Client& client : session.clients) {
                     if (client.used) {
@@ -1111,6 +1253,10 @@ void wait_for_start() {
                 }
                 break;
             }
+        } else if (cancel_pressed) {
+            send_leave(session.host_address);
+            end_session("you left the game");
+            break;
         } else if (now - last_send >= hello_interval) {
             last_send = now;
             if (session.welcomed && session.have_mask == all_chunks) {
@@ -1148,14 +1294,91 @@ void wait_for_start() {
     publish_status();
 }
 
+// Lobby sessions: the game launches on every device after the start, and some load faster than others. Hold the
+// first tick until every device has loaded, so nobody's game runs ahead (or reports the others as disconnected).
+void wait_for_loaded() {
+    log_msg("waiting for every device to load the game");
+    session.loading_done = false;
+    publish_status();
+    const auto begin = clock_type::now();
+    auto last_send = clock_type::time_point{};
+    while (!session.ended) {
+        const auto now = clock_type::now();
+        if (session.is_host) {
+            bool all_loaded = true;
+            for (uint8_t c = 0; c < max_clients; c++) {
+                Client& client = session.clients[c];
+                if (!client.used || client.dropped || client.loaded) {
+                    continue;
+                }
+                if (now - begin > loading_timeout) {
+                    drop_client(c);
+                    continue;
+                }
+                all_loaded = false;
+            }
+            if (all_loaded) {
+                session.loading_done = true;
+                Header go;
+                fill_header(go, Go);
+                for (const Client& client : session.clients) {
+                    if (client.used && !client.dropped) {
+                        send_to(client.address, &go, sizeof(go));
+                    }
+                }
+                break;
+            }
+        } else {
+            if (session.go_received) {
+                session.loading_done = true;
+                break;
+            }
+            if (now - session.last_host_receive > loading_timeout && now - begin > loading_timeout) {
+                end_session("the host did not finish loading the game");
+                break;
+            }
+            if (now - last_send >= hello_interval) {
+                last_send = now;
+                Header loaded;
+                fill_header(loaded, Loaded);
+                send_to(session.host_address, &loaded, sizeof(loaded));
+            }
+        }
+        static auto last_publish = clock_type::time_point{};
+        if (now - last_publish >= std::chrono::milliseconds(250)) {
+            last_publish = now;
+            publish_status();
+        }
+        pump(std::chrono::milliseconds(20));
+    }
+    log_msg("every device has loaded; playing");
+    const auto now = clock_type::now();
+    session.grace_until = now + startup_grace;
+    session.last_host_receive = now;
+    for (Client& client : session.clients) {
+        client.last_receive = now;
+    }
+    publish_status();
+}
+
 // Copies the state the overlay needs into its mutex-protected snapshot (read on the UI thread).
 void publish_status() {
     sk1net::OverlayStatus status;
     status.paused = session.paused;
     status.waiting_to_start = !session.started;
     status.host_away = session.host_away;
+    status.loading = session.lobby_mode && session.started && (!session.loading_done ||
+        (session.grace_stall && !session.paused && !session.waiting_for_host));
+    if (session.is_host && !session.started) {
+        bool joiners_ready = true;
+        for (const Client& client : session.clients) {
+            joiners_ready &= !client.used || client.ready;
+        }
+        status.can_start = joiners_ready && session.next_free_port >= 2;
+    }
+    // Lobby sessions show the waiting room in the Netplay screen, not over the game.
     status.visible = session.enabled && !session.ended &&
-        (!session.started || session.paused || session.waiting_for_host);
+        ((!session.started && !session.lobby_mode) || status.loading || session.paused || session.waiting_for_host);
     status.players_joined = session.next_free_port;
     if (session.is_host) {
         status.address = session.local_address_text;
@@ -1200,8 +1423,6 @@ bool local_button_pressed(uint32_t local_index, uint16_t mask) {
     return pressed;
 }
 
-constexpr uint16_t n64_button_a = 0x8000;
-constexpr uint16_t n64_button_start = 0x1000;
 
 // Host: refresh each joiner's displayed state from how recently it was heard from and whether it is behind.
 void host_update_port_states(uint32_t needed_tick) {
@@ -1331,6 +1552,13 @@ extern "C" void recomp_get_netplay_view_port(uint8_t* rdram, recomp_context* ctx
     _return<s32>(ctx, own_view ? static_cast<s32>(session.first_port) : -1);
 }
 
+// s32 recomp_get_netplay_player_count(void): the number of players in a running netplay session, or 0 without one.
+// The race setup menu fixes its player count to it (patches/netplay_player_count.c).
+extern "C" void recomp_get_netplay_player_count(uint8_t* rdram, recomp_context* ctx) {
+    const bool running = session.enabled && session.started && !session.ended;
+    _return<s32>(ctx, running ? static_cast<s32>(session.total_ports) : 0);
+}
+
 sk1net::OverlayStatus sk1net::overlay_status() {
     std::lock_guard lock{ session.status_mutex };
     sk1net::OverlayStatus status = session.status;
@@ -1350,6 +1578,67 @@ int sk1net::local_player_for_port(int port) {
     return port - session.first_port;
 }
 
+bool sk1net::begin_lobby_session(const std::string& save_path) {
+    finish_lobby_session(); // a previous lobby session that never started
+    lobby_start_requested = false;
+    lobby_cancel_requested = false;
+    session.lobby_mode = true; // read by init() and everything after it
+    session.save_path = save_path;
+    init();
+    if (!session.enabled) {
+        if (session.end_reason.empty()) {
+            session.end_reason = "Netplay could not start on this device (no network?).";
+        }
+        lobby_state_value = static_cast<int>(LobbyState::Ended);
+        return false;
+    }
+    lobby_state_value = static_cast<int>(LobbyState::Waiting);
+    lobby_thread = std::thread([] {
+        wait_for_start();
+        lobby_state_value = static_cast<int>(session.started ? LobbyState::Started : LobbyState::Ended);
+    });
+    return true;
+}
+
+sk1net::LobbyState sk1net::lobby_state() {
+    return static_cast<LobbyState>(lobby_state_value.load());
+}
+
+void sk1net::lobby_request_start() {
+    lobby_start_requested = true;
+}
+
+void sk1net::lobby_request_cancel() {
+    lobby_cancel_requested = true;
+}
+
+std::string sk1net::finish_lobby_session() {
+    if (lobby_thread.joinable()) {
+        lobby_cancel_requested = true;
+        lobby_thread.join();
+    }
+    if (!session.initialised || session.started) {
+        return {};
+    }
+    // Ended (or never got going): close everything, so the next attempt starts from scratch.
+    std::string reason = session.end_reason;
+    if (session.sock != invalid_socket) {
+#ifdef _WIN32
+        closesocket(session.sock);
+#else
+        close(session.sock);
+#endif
+    }
+    if (session.log != nullptr) {
+        std::fclose(session.log);
+    }
+    SDL_DelEventWatch(app_event_watch, nullptr);
+    session.~Session();
+    new (&session) Session();
+    lobby_state_value = static_cast<int>(LobbyState::Ended);
+    return reason;
+}
+
 bool sk1net::active() {
     init();
     return session.enabled && !session.ended;
@@ -1362,6 +1651,12 @@ void sk1net::pre_tick(uint8_t* rdram, gpr inputs) {
     if (!session.started) {
         wait_for_start();
         if (!session.started) {
+            return;
+        }
+    }
+    if (session.lobby_mode && !session.loading_done) {
+        wait_for_loaded();
+        if (!active()) {
             return;
         }
     }
@@ -1403,7 +1698,14 @@ void sk1net::pre_tick(uint8_t* rdram, gpr inputs) {
             hold_while_paused(session.tick);
             continue;
         }
-        if (session.is_host) {
+        if (now < session.grace_until) {
+            // Start-up grace period: a slow device is still loading, not lost.
+            if (!session.grace_stall && now - wait_start > pause_after) {
+                session.grace_stall = true;
+                log_msg("waiting for a device that is still starting up");
+                publish_status();
+            }
+        } else if (session.is_host) {
             if (now - wait_start > pause_after) {
                 host_update_port_states(session.tick);
                 host_begin_pause("waiting for a player");
@@ -1429,8 +1731,9 @@ void sk1net::pre_tick(uint8_t* rdram, gpr inputs) {
             send_inputs();
         }
     }
-    if (session.waiting_for_host) {
+    if (session.waiting_for_host || session.grace_stall) {
         session.waiting_for_host = false;
+        session.grace_stall = false;
         publish_status();
     }
     const auto waited = std::chrono::duration_cast<std::chrono::microseconds>(clock_type::now() - wait_start);
