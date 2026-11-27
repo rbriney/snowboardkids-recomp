@@ -163,7 +163,7 @@ index 08f83e5..58a3cfe 100755
          if (SDL_VideoInit(nullptr) != 0) {
              printf("Failed to init SDL2 video: %s\n", SDL_GetError());
 diff --git a/src/hle/rt64_state.cpp b/src/hle/rt64_state.cpp
-index 00ebbf0..6470a68 100644
+index 00ebbf0..720c1ed 100644
 --- a/src/hle/rt64_state.cpp
 +++ b/src/hle/rt64_state.cpp
 @@ -4,6 +4,8 @@
@@ -185,31 +185,31 @@ index 00ebbf0..6470a68 100644
      void State::updateScreen(const VI &newVI, bool fromEarlyPresent) {
          // If the debugger has paused the plugin, keep submitting the last workload and screen VI for rendering and a present event.
          if (debuggerInspector.paused && !fromEarlyPresent) {
-@@ -1890,8 +1895,9 @@ namespace RT64 {
-                 lastScreenFactorCounter++;
-             }
- 
--            // We ignore processing the updateScreen altogether in early present mode.
--            if (presentEarly) {
-+            // We ignore processing the updateScreen altogether in early present mode (unless presents are forced
-+            // because the game is deliberately frozen, in which case no early presents arrive).
-+            if (presentEarly && !forcePresentRequested.load()) {
+@@ -1862,6 +1867,23 @@ namespace RT64 {
                  return;
              }
          }
-@@ -1949,8 +1955,9 @@ namespace RT64 {
-             }
-         }
++
++        // While the game is deliberately frozen (e.g. a netplay pause) it submits no frames, but UI overlays drawn at
++        // present time still need updating: re-show the last frame, as the debugger's pause does. Building a new
++        // present from the VI instead could alternate between framebuffers and make the frozen image flicker.
++        if (forcePresentRequested.load() && !fromEarlyPresent) {
++            ext.workloadQueue->waitForWorkloadId(workloadId);
++            ext.presentQueue->waitForPresentId(presentId);
++            ext.workloadQueue->waitForIdle();
++            ext.presentQueue->waitForIdle();
++            Workload &lastWorkload = ext.workloadQueue->workloads[ext.workloadQueue->previousWriteCursor()];
++            Present &lastPresent = ext.presentQueue->presents[ext.presentQueue->previousWriteCursor()];
++            advanceWorkload(lastWorkload, true);
++            advancePresent(lastPresent, true);
++            ext.workloadQueue->repeatLastWorkload();
++            ext.presentQueue->repeatLastPresent();
++            return;
++        }
          
--        // We only push a new present event to the timeline when it's necessary.
--        if (fromEarlyPresent || viDifferent || fbChangesMade || screenChangesMade) {
-+        // We only push a new present event to the timeline when it's necessary. While the game is deliberately held
-+        // (e.g. a netplay pause) nothing on screen changes, but UI overlays drawn at present time still need updating.
-+        if (fromEarlyPresent || viDifferent || fbChangesMade || screenChangesMade || forcePresentRequested.load()) {
-             // Push a new renderer event to the timeline for presenting this VI.
-             present.screenVI = newVI;
-             advancePresent(present, false);
-@@ -2824,4 +2831,10 @@ namespace RT64 {
+         const int presentCursor = ext.presentQueue->writeCursor;
+         Present &present = ext.presentQueue->presents[presentCursor];
+@@ -2824,4 +2846,10 @@ namespace RT64 {
              break;
          }
      }
