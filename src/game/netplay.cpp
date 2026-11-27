@@ -89,7 +89,7 @@ constexpr socket_t invalid_socket = -1;
 using clock_type = std::chrono::steady_clock;
 
 constexpr uint32_t packet_magic = 0x4E314B53; // "SK1N"
-constexpr uint16_t protocol_version = 4; // 4: desync hash ignores racer shadow-buffer pointers
+constexpr uint16_t protocol_version = 5; // 5: Away packets, no joiner timeout
 constexpr uint32_t save_size = 0x8000;
 constexpr uint32_t chunk_size = 1024;
 constexpr uint32_t chunk_count = save_size / chunk_size;
@@ -102,7 +102,6 @@ constexpr uint32_t no_tick = 0xFFFFFFFFu;
 constexpr uint8_t host_id = 0;
 constexpr uint8_t unassigned_id = 0xFF;
 constexpr uint8_t no_owner = 0xFF;
-constexpr auto peer_timeout = std::chrono::seconds(60);      // a joiner without the host gives up after this
 constexpr auto pause_after = std::chrono::milliseconds(1500); // host pauses after waiting this long for a joiner
 constexpr auto disconnected_after = std::chrono::seconds(4);  // a silent joiner is shown as disconnected
 constexpr auto scripted_drop_after = std::chrono::seconds(3); // unattended tests: drop a disconnected joiner
@@ -115,6 +114,7 @@ enum PacketType : uint8_t {
     Hello = 1, Welcome = 2, SaveChunk = 3, Ready = 4, Start = 5, Input = 6, Full = 7,
     Discover = 8, // LAN discovery: anyone -> broadcast
     HostInfo = 9, // LAN discovery: a waiting host -> the asker
+    Away = 10,    // the sender's app is going into the background (Android); it will be silent until it returns
 };
 
 #pragma pack(push, 1)
@@ -144,6 +144,10 @@ struct SaveChunkPacket {
     uint8_t index;
     uint8_t padding[3];
     uint8_t data[chunk_size];
+};
+struct AwayPacket {
+    Header header;
+    uint32_t sequence; // the sender's last INPUT packet sequence; only newer INPUT packets mean it is back
 };
 struct HostInfoPacket {
     Header header;
@@ -221,6 +225,8 @@ struct Client {
     clock_type::time_point last_receive{};
     std::array<uint32_t, port_count> acks{}; // the joiner holds every input below acks[p]
     uint32_t last_sequence = 0;
+    bool away = false;           // sent Away and has not sent a newer INPUT packet since
+    uint32_t away_sequence = 0;  // its INPUT sequence number when it went away
 };
 
 struct Session {
@@ -284,6 +290,8 @@ struct Session {
     uint32_t sequence = 0;
     uint32_t host_last_sequence = 0;
     bool waiting_for_host = false; // joiner: shown when the host has been quiet a while
+    bool host_away = false;        // joiner: the host sent Away and has not sent a newer INPUT packet since
+    uint32_t host_away_sequence = 0;
     std::mutex status_mutex;
     sk1net::OverlayStatus status;
 
@@ -332,6 +340,20 @@ std::string address_text(const sockaddr_in& a) {
 bool same_address(const sockaddr_in& a, const sockaddr_in& b) {
     return a.sin_addr.s_addr == b.sin_addr.s_addr && a.sin_port == b.sin_port;
 }
+
+// The sequence number of an INPUT packet, or 0 for anything else.
+uint32_t input_sequence(const uint8_t* data, size_t size, const Header& h) {
+    if (h.type != Input || size < sizeof(Header) + sizeof(uint32_t)) {
+        return 0;
+    }
+    uint32_t sequence;
+    std::memcpy(&sequence, data + sizeof(Header), sizeof(sequence));
+    return sequence;
+}
+
+// Defined further down.
+void publish_status();
+int SDLCALL app_event_watch(void*, SDL_Event* event);
 
 void fill_header(Header& h, PacketType type) {
     h.magic = packet_magic;
@@ -537,7 +559,7 @@ void handle_input(const uint8_t* data, size_t size, uint8_t sender) {
             const uint8_t local_mask = uint8_t(((1u << session.local_players) - 1) << session.first_port);
             session.ready_mask = uint8_t((header.ready_mask & ~local_mask) | (session.ready_mask & local_mask));
             for (uint32_t p = 0; p < port_count; p++) {
-                session.port_states[p] = static_cast<sk1net::PlayerState>(header.port_states[p] & 3);
+                session.port_states[p] = static_cast<sk1net::PlayerState>(header.port_states[p] & 7);
             }
         }
     }
@@ -644,6 +666,21 @@ void host_process(const uint8_t* data, size_t size, const Header& h, const socka
     }
     Client& client = session.clients[index];
     client.last_receive = clock_type::now();
+    if (h.type == Away) {
+        if (!client.away && size >= sizeof(AwayPacket)) {
+            AwayPacket away;
+            std::memcpy(&away, data, sizeof(away));
+            client.away = true;
+            client.away_sequence = away.sequence;
+            log_msg("joiner %d switched to another app", index + 1);
+        }
+        return;
+    }
+    // Only an INPUT packet sent after the Away means the joiner is back (older ones can arrive late).
+    if (client.away && input_sequence(data, size, h) > client.away_sequence) {
+        client.away = false;
+        log_msg("joiner %d is back", index + 1);
+    }
     switch (h.type) {
         case Ready:
             if (!client.ready) {
@@ -667,6 +704,23 @@ void joiner_process(const uint8_t* data, size_t size, const Header& h, const soc
         return;
     }
     session.last_host_receive = clock_type::now();
+    if (h.type == Away) {
+        if (!session.host_away && size >= sizeof(AwayPacket)) {
+            AwayPacket away;
+            std::memcpy(&away, data, sizeof(away));
+            session.host_away = true;
+            session.host_away_sequence = away.sequence;
+            log_msg("the host switched to another app");
+            publish_status();
+        }
+        return;
+    }
+    // Only an INPUT packet sent after the Away means the host is back (older ones can arrive late).
+    if (session.host_away && input_sequence(data, size, h) > session.host_away_sequence) {
+        session.host_away = false;
+        log_msg("the host is back");
+        publish_status();
+    }
     switch (h.type) {
         case Welcome:
             if (size >= sizeof(WelcomePacket)) {
@@ -921,6 +975,7 @@ void init() {
         ticks.fill(no_tick);
     }
     session.enabled = true;
+    SDL_AddEventWatch(app_event_watch, nullptr);
     if (hosting) {
         session.local_address_text = sk1net::local_address() + ":" + std::to_string(session.local_port);
     }
@@ -960,6 +1015,45 @@ void drop_client(uint8_t index) {
     }
     log_msg("continuing without joiner %u: neutral input for ports %u-%u", index + 1, client.first_port + 1,
         client.first_port + client.local_players);
+}
+
+// Android pauses the whole game while the app is in the background, so it goes silent. Tell the others first, so they
+// can show that this player switched away rather than lost their connection. SDL calls this event watch synchronously
+// from the thread that delivers the app event, just before the game is frozen.
+// Set when the host's app comes back from the background; the game thread then pauses the session, so that every
+// player confirms with A before the race continues.
+std::atomic<bool> pause_after_returning{ false };
+
+int SDLCALL app_event_watch(void*, SDL_Event* event) {
+    if (!session.enabled || session.ended) {
+        return 0;
+    }
+    if (event->type == SDL_APP_DIDENTERFOREGROUND) {
+        if (session.is_host && session.started) {
+            pause_after_returning = true;
+        }
+        return 0;
+    }
+    if (event->type != SDL_APP_WILLENTERBACKGROUND) {
+        return 0;
+    }
+    AwayPacket away{};
+    fill_header(away.header, Away);
+    away.sequence = session.sequence;
+    // A few copies: there is no chance to resend once the app is frozen.
+    for (int i = 0; i < 3; i++) {
+        if (session.is_host) {
+            for (const Client& client : session.clients) {
+                if (client.used && !client.dropped) {
+                    send_now(client.address, &away, sizeof(away));
+                }
+            }
+        } else if (session.welcomed) {
+            send_now(session.host_address, &away, sizeof(away));
+        }
+    }
+    log_msg("switching to another app: told the other players");
+    return 0;
 }
 
 // Neutral input for ports whose joiner has dropped, up to the newest tick this machine has scheduled.
@@ -1059,6 +1153,7 @@ void publish_status() {
     sk1net::OverlayStatus status;
     status.paused = session.paused;
     status.waiting_to_start = !session.started;
+    status.host_away = session.host_away;
     status.visible = session.enabled && !session.ended &&
         (!session.started || session.paused || session.waiting_for_host);
     status.players_joined = session.next_free_port;
@@ -1074,8 +1169,12 @@ void publish_status() {
         player.host = session.owners[p] == host_id;
         player.local = is_local_port(p);
         player.state = session.port_states[p];
+        // A joiner knows more about the host's own players than the host's last packet said.
+        if (!session.is_host && player.host && session.started && !session.paused && session.waiting_for_host) {
+            player.state = session.host_away ? sk1net::PlayerState::Away : sk1net::PlayerState::Lagging;
+        }
         player.ready = (session.ready_mask & (1u << p)) != 0;
-        if (player.state == sk1net::PlayerState::Disconnected) {
+        if (player.state == sk1net::PlayerState::Disconnected || player.state == sk1net::PlayerState::Away) {
             status.can_continue_without = true;
         }
     }
@@ -1117,7 +1216,9 @@ void host_update_port_states(uint32_t needed_tick) {
             behind |= session.ports[client.first_port + i].next <= needed_tick;
         }
         sk1net::PlayerState state = sk1net::PlayerState::Connected;
-        if (now - client.last_receive > disconnected_after) {
+        if (client.away) {
+            state = sk1net::PlayerState::Away;
+        } else if (now - client.last_receive > disconnected_after) {
             state = sk1net::PlayerState::Disconnected;
         } else if (behind && now - client.last_receive > std::chrono::milliseconds(500)) {
             state = sk1net::PlayerState::Lagging;
@@ -1164,7 +1265,7 @@ void hold_while_paused(uint32_t needed_tick) {
                 if (state == sk1net::PlayerState::Dropped) {
                     continue;
                 }
-                if (state == sk1net::PlayerState::Disconnected) {
+                if (state == sk1net::PlayerState::Disconnected || state == sk1net::PlayerState::Away) {
                     any_disconnected = true;
                     all_ready = false;
                 } else if (!(session.ready_mask & (1u << p))) {
@@ -1181,7 +1282,8 @@ void hold_while_paused(uint32_t needed_tick) {
                     for (uint8_t c = 0; c < max_clients; c++) {
                         const Client& client = session.clients[c];
                         if (client.used && !client.dropped &&
-                            session.port_states[client.first_port] == sk1net::PlayerState::Disconnected) {
+                            (session.port_states[client.first_port] == sk1net::PlayerState::Disconnected ||
+                             session.port_states[client.first_port] == sk1net::PlayerState::Away)) {
                             drop_client(c);
                         }
                     }
@@ -1194,8 +1296,9 @@ void hold_while_paused(uint32_t needed_tick) {
                 session.paused = false;
                 log_msg("resumed: every connected player is ready");
             }
-        } else if (now - session.last_host_receive > peer_timeout) {
-            end_session("no packets from the host for 60 seconds");
+        } else if (now - session.last_host_receive > pause_after && local_button_pressed(0, n64_button_start)) {
+            // The host is unreachable: the joiner may stop waiting and play on alone.
+            end_session("you stopped waiting for the host");
         }
         if (now - last_send >= resend_interval) {
             last_send = now;
@@ -1263,6 +1366,9 @@ void sk1net::pre_tick(uint8_t* rdram, gpr inputs) {
         }
     }
 
+    if (session.is_host && pause_after_returning.exchange(false)) {
+        host_begin_pause("the host came back from another app");
+    }
     if (session.paused) {
         hold_while_paused(session.tick);
     }
@@ -1307,10 +1413,14 @@ void sk1net::pre_tick(uint8_t* rdram, gpr inputs) {
             const bool waiting = now - session.last_host_receive > pause_after;
             if (waiting != session.waiting_for_host) {
                 session.waiting_for_host = waiting;
+                if (waiting) {
+                    session.a_was_down.fill(true); // a Start already held does not count as leaving
+                }
                 publish_status();
             }
-            if (now - session.last_host_receive > peer_timeout) {
-                end_session("no packets from the host for 60 seconds");
+            // No timeout: the joiner waits as long as it likes, and Start leaves the session.
+            if (waiting && local_button_pressed(0, n64_button_start)) {
+                end_session("you stopped waiting for the host");
                 return;
             }
         }

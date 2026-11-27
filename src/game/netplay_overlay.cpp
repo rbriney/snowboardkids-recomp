@@ -86,6 +86,9 @@ std::string player_line(const sk1net::OverlayStatus& status, uint32_t port) {
         case sk1net::PlayerState::Dropped:
             line += "Left the race (the game continues without them)";
             break;
+        case sk1net::PlayerState::Away:
+            line += "Switched to another app - waiting for them to come back";
+            break;
     }
     return line;
 }
@@ -127,7 +130,8 @@ void frame_hook() {
         }
         return;
     }
-    overlay.title->set_text(status.paused ? "Netplay paused" : "Waiting for the host...");
+    overlay.title->set_text(status.paused ? "Netplay paused"
+            : status.host_away ? "The host switched to another app" : "Waiting for the host...");
     for (uint32_t port = 0; port < overlay.players.size(); port++) {
         if (port < status.total_ports) {
             overlay.players[port]->set_display(recompui::Display::Block);
@@ -140,10 +144,13 @@ void frame_hook() {
     if (status.paused) {
         footer = "The race resumes once every connected player has pressed A.";
         if (status.am_host && status.can_continue_without) {
-            footer += " Host: press Start to continue without the disconnected players.";
+            footer += " Host: press Start to continue without the players who are away or disconnected.";
         }
     } else {
-        footer = "The game will continue as soon as the host's connection recovers (up to a minute).";
+        footer = status.host_away
+            ? "The game continues when the host comes back. Press Start to stop waiting and play on alone."
+            : "The game continues as soon as the host's connection recovers. Press Start to stop waiting and play "
+              "on alone.";
     }
     overlay.footer->set_text(footer);
     overlay.context.close();

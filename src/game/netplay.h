@@ -31,7 +31,7 @@
 //   SK1_NET_SIM_LATENCY=<ms>         delay outgoing packets
 //   SK1_NET_SIM_JITTER=<ms>          add up to this much random extra delay (can reorder packets)
 namespace sk1net {
-    enum class PlayerState : uint8_t { Connected = 0, Lagging = 1, Disconnected = 2, Dropped = 3 };
+    enum class PlayerState : uint8_t { Connected = 0, Lagging = 1, Disconnected = 2, Dropped = 3, Away = 4 };
     struct PlayerStatus {
         bool host = false;  // this player's machine is the host
         bool local = false; // this player is on this machine
@@ -43,6 +43,7 @@ namespace sk1net {
         bool visible = false;
         bool paused = false; // session-wide pause (otherwise: this machine waiting for the host)
         bool waiting_to_start = false; // before the first tick: host waiting for players, or joiner connecting
+        bool host_away = false;        // joiner: the host has switched to another app
         uint32_t players_joined = 0;   // host, before the start
         std::string address;           // host: this device's address and port; joiner: the host's
         bool am_host = false;
