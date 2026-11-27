@@ -25,6 +25,7 @@
 #include <atomic>
 #include <array>
 #include <chrono>
+#include <cmath>
 #include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
@@ -73,6 +74,7 @@
 #include "netplay.h"
 #include "determinism_harness.h"
 #include "netplay_overlay.h"
+#include "netplay_internet.h"
 #include "recompinput/profiles.h"
 
 // RT64 (rt64.patch): keep presenting while the game is held, so the status overlay is drawn.
@@ -91,7 +93,7 @@ constexpr socket_t invalid_socket = -1;
 using clock_type = std::chrono::steady_clock;
 
 constexpr uint32_t packet_magic = 0x4E314B53; // "SK1N"
-constexpr uint16_t protocol_version = 6; // 6: lobby waiting room (Leave, Loaded, Go)
+constexpr uint16_t protocol_version = 7; // 7: internet play (Ping/Pong, adaptive input delay)
 constexpr uint32_t save_size = 0x8000;
 constexpr uint32_t chunk_size = 1024;
 constexpr uint32_t chunk_count = save_size / chunk_size;
@@ -115,6 +117,12 @@ constexpr auto loading_timeout = std::chrono::seconds(90);     // lobby sessions
 // (e.g. Android setting up graphics). For this long after the start, waiting shows "Starting the game" instead of
 // pausing the session.
 constexpr auto startup_grace = std::chrono::seconds(30);
+// Ping often: a race sends 30 packets a second, and a mobile connection pinged only now and then sits in a
+// power-saving state with much higher latency than it has during the race.
+constexpr auto ping_interval = std::chrono::milliseconds(50);
+constexpr size_t ping_samples = 60; // the last three seconds
+constexpr double tick_ms = 1000.0 / 30.0;    // the game runs 30 ticks a second
+constexpr uint32_t max_adaptive_delay = 12;  // 400 ms; beyond this the game would feel unplayable anyway
 constexpr uint32_t stats_interval = 900; // 30 seconds of game time
 static_assert(chunk_count == 32);
 
@@ -126,6 +134,8 @@ enum PacketType : uint8_t {
     Leave = 11,   // before the start: a joiner leaves, or the host cancels the game
     Loaded = 12,  // lobby sessions: a joiner has launched the game and reached its first tick
     Go = 13,      // lobby sessions: the host -> joiners, everyone has loaded; play the first tick
+    Ping = 14,    // before the start: the host -> a joiner, echoed back as PONG to measure the round trip
+    Pong = 15,
 };
 
 #pragma pack(push, 1)
@@ -170,7 +180,12 @@ struct StartPacket {
     Header header;
     uint8_t total_ports;
     uint8_t owners[port_count];
-    uint8_t padding[3];
+    uint8_t delay; // input delay in ticks, chosen from the measured round trips
+    uint8_t padding[2];
+};
+struct PingPacket {
+    Header header;
+    uint32_t millis; // the host's clock when sent, echoed back unchanged
 };
 struct WireInput {
     uint16_t buttons;
@@ -239,6 +254,10 @@ struct Client {
     bool away = false;           // sent Away and has not sent a newer INPUT packet since
     uint32_t away_sequence = 0;  // its INPUT sequence number when it went away
     bool loaded = false;         // lobby sessions: has reached the first tick
+    float rtt_ms = -1.0f;        // typical (median) recent round trip to this joiner (-1: not measured yet)
+    float rtt_high_ms = 0.0f;    // 80th percentile of the recent round trips, which the input delay is based on
+    std::array<float, ping_samples> rtt_samples{};
+    uint32_t rtt_count = 0;
 };
 
 struct Session {
@@ -251,6 +270,13 @@ struct Session {
     std::string save_path;       // lobby sessions, host: the save file to share
     clock_type::time_point grace_until{}; // lobby sessions: no pausing for slow devices before this
     bool grace_stall = false;    // waiting for a slow device during the start-up grace period
+    bool internet = false;       // host of a lobby session: open the router's port and look up the public address
+    bool delay_from_env = false; // SK1_NET_DELAY was given: keep it rather than adapting to the ping
+    sockaddr_in stun_server{};
+    bool stun_resolved = false;
+    uint32_t stun_tries = 0;
+    clock_type::time_point last_stun{};
+    std::string public_address;  // from STUN
     bool started = false;
     bool ended = false;
     bool is_host = false;
@@ -628,9 +654,38 @@ void send_welcome(uint8_t client_index, uint32_t have_mask) {
     }
 }
 
+// Changes the input delay before the start. Ticks below the delay have no scheduled input: every port is neutral.
+void set_delay(uint32_t delay) {
+    session.delay = delay;
+    for (PortStream& stream : session.ports) {
+        for (uint32_t t = 0; t < delay; t++) {
+            stream.set(t, WireInput{});
+        }
+    }
+}
+
+// The input delay the measured round trips call for. Inputs from one joiner reach another through the host, so the
+// worst path is about one full round trip; add a margin for jitter.
+uint32_t delay_for_pings() {
+    float worst = 0.0f;
+    for (const Client& client : session.clients) {
+        if (client.used) {
+            worst = std::max(worst, std::max(client.rtt_ms, client.rtt_high_ms));
+        }
+    }
+    const uint32_t ticks = static_cast<uint32_t>(std::ceil((worst + 20.0f) / tick_ms));
+    return std::clamp<uint32_t>(ticks, 3, max_adaptive_delay);
+}
+
+uint32_t now_millis() {
+    return static_cast<uint32_t>(
+        std::chrono::duration_cast<std::chrono::milliseconds>(clock_type::now().time_since_epoch()).count());
+}
+
 void send_start(const sockaddr_in& to) {
     StartPacket s{};
     fill_header(s.header, Start);
+    s.delay = static_cast<uint8_t>(session.delay);
     s.total_ports = session.total_ports;
     std::memcpy(s.owners, session.owners.data(), port_count);
     send_to(to, &s, sizeof(s));
@@ -749,6 +804,22 @@ void host_process(const uint8_t* data, size_t size, const Header& h, const socka
         log_msg("joiner %d is back", index + 1);
     }
     switch (h.type) {
+        case Pong:
+            if (size >= sizeof(PingPacket)) {
+                PingPacket pong;
+                std::memcpy(&pong, data, sizeof(pong));
+                const float rtt = static_cast<float>(now_millis() - pong.millis);
+                if (rtt >= 0.0f && rtt < 5000.0f) {
+                    client.rtt_samples[client.rtt_count % ping_samples] = rtt;
+                    client.rtt_count++;
+                    const size_t n = std::min<size_t>(client.rtt_count, ping_samples);
+                    std::array<float, ping_samples> sorted = client.rtt_samples;
+                    std::sort(sorted.begin(), sorted.begin() + n);
+                    client.rtt_ms = sorted[n / 2];
+                    client.rtt_high_ms = sorted[std::min(n - 1, n * 4 / 5)];
+                }
+            }
+            break;
         case Leave:
             if (!session.started) {
                 remove_client(uint8_t(index), "left");
@@ -839,6 +910,9 @@ void joiner_process(const uint8_t* data, size_t size, const Header& h, const soc
                 std::memcpy(&p, data, sizeof(p));
                 session.total_ports = std::clamp<uint8_t>(p.total_ports, 2, port_count);
                 std::memcpy(session.owners.data(), p.owners, port_count);
+                if (p.delay >= 1 && p.delay <= 30 && p.delay != session.delay) {
+                    set_delay(p.delay);
+                }
                 // Ports may have moved up since the WELCOME (an earlier joiner left).
                 for (uint8_t port = 0; port < port_count; port++) {
                     if (session.owners[port] == session.my_id) {
@@ -862,6 +936,14 @@ void joiner_process(const uint8_t* data, size_t size, const Header& h, const soc
         case Go:
             session.go_received = true;
             break;
+        case Ping:
+            if (size >= sizeof(PingPacket)) {
+                PingPacket pong;
+                std::memcpy(&pong, data, sizeof(pong));
+                fill_header(pong.header, Pong);
+                send_to(session.host_address, &pong, sizeof(pong));
+            }
+            break;
         case Full:
             if (!session.welcomed && !session.ended) {
                 session.ended = true;
@@ -873,6 +955,16 @@ void joiner_process(const uint8_t* data, size_t size, const Header& h, const soc
 }
 
 void process_packet(const uint8_t* data, size_t size, const sockaddr_in& from) {
+    if (session.stun_resolved && sk1net_internet::is_stun_packet(data, size) &&
+        same_address(from, session.stun_server)) {
+        const std::string mapped = sk1net_internet::parse_stun_response(data, size);
+        if (!mapped.empty() && session.public_address.empty()) {
+            session.public_address = mapped;
+            log_msg("public address (STUN): %s", mapped.c_str());
+            publish_status();
+        }
+        return;
+    }
     if (size < sizeof(Header)) {
         return;
     }
@@ -1018,6 +1110,10 @@ void init() {
         local.sin_port = htons(static_cast<uint16_t>(std::atoi(host)));
         session.local_port = static_cast<uint16_t>(std::atoi(host));
         session.delay = env_uint("SK1_NET_DELAY", 1, 30, 3);
+        const char* fixed_delay = std::getenv("SK1_NET_DELAY");
+        session.delay_from_env = fixed_delay != nullptr && *fixed_delay != '\0';
+        // Lobby hosts can be reached over the internet: open the router's port, look up the public address.
+        session.internet = session.lobby_mode && env_uint("SK1_NET_INTERNET", 0, 1, 1) != 0;
         // Up to four players can join. The host starts the game (Start) with whoever has joined; unattended tests
         // can instead start automatically once SK1_NET_PLAYERS players have joined.
         session.total_ports = static_cast<uint8_t>(port_count);
@@ -1082,6 +1178,10 @@ void init() {
         session.local_address_text = sk1net::local_address() + ":" + std::to_string(session.local_port);
     }
     sk1net_overlay::install();
+    if (session.internet) {
+        sk1net_internet::set_logger([](const char* message) { log_msg("%s", message); });
+        sk1net_internet::open_port(session.local_port);
+    }
     if (hosting) {
         log_msg("hosting on UDP port %u with %u local player(s); up to %u more can join",
             ntohs(local.sin_port), session.local_players, port_count - session.local_players);
@@ -1099,6 +1199,15 @@ void end_session(const char* reason) {
         session.waiting_for_host = false;
         publish_status(); // hides the overlay and stops forced presents
         log_msg("session ended: %s", reason);
+        if (session.internet) {
+            // Before the start this runs on the waiting-room thread, which the lobby joins before another attempt
+            // can open the port again; mid-game it must not hold up the game.
+            if (session.started) {
+                std::thread([] { sk1net_internet::close_port(); }).detach();
+            } else {
+                sk1net_internet::close_port();
+            }
+        }
         if (session.lobby_mode && !session.started) {
             session.end_reason = reason;
             return;
@@ -1223,10 +1332,41 @@ void wait_for_start() {
                     remove_client(c, "stopped answering");
                 }
             }
+            // Internet play: ask the STUN server for our public address (a few tries, from the game's socket).
+            if (session.internet && session.public_address.empty() && session.stun_tries < 5 &&
+                now - session.last_stun >= std::chrono::seconds(1)) {
+                session.last_stun = now;
+                if (session.stun_tries == 0) {
+                    session.stun_resolved = sk1net_internet::resolve_stun_server(session.stun_server);
+                    if (!session.stun_resolved) {
+                        log_msg("cannot resolve the STUN server %s", sk1net_internet::stun_host);
+                        session.stun_tries = 5;
+                    }
+                }
+                if (session.stun_resolved) {
+                    uint8_t request[20];
+                    const size_t length = sk1net_internet::make_stun_request(request);
+                    send_now(session.stun_server, request, length);
+                    session.stun_tries++;
+                }
+            }
+            // Measure the round trip to each joiner.
+            static auto last_ping = clock_type::time_point{};
+            if (now - last_ping >= ping_interval) {
+                last_ping = now;
+                PingPacket ping{};
+                fill_header(ping.header, Ping);
+                ping.millis = now_millis();
+                for (const Client& client : session.clients) {
+                    if (client.used) {
+                        send_to(client.address, &ping, sizeof(ping));
+                    }
+                }
+            }
             bool joiners_ready = true;
             for (const Client& client : session.clients) {
-                if (client.used && !client.ready) {
-                    joiners_ready = false; // still receiving the save
+                if (client.used && (!client.ready || client.rtt_ms < 0.0f)) {
+                    joiners_ready = false; // still receiving the save, or its round trip is not measured yet
                 }
             }
             const bool enough_players = session.next_free_port >= 2;
@@ -1245,6 +1385,16 @@ void wait_for_start() {
             if (enough_players && joiners_ready && (host_starts || auto_start)) {
                 // The session has exactly the players who joined; nobody can join once it has started.
                 session.total_ports = session.next_free_port;
+                if (!session.delay_from_env) {
+                    set_delay(delay_for_pings());
+                }
+                for (uint8_t c = 0; c < max_clients; c++) {
+                    if (session.clients[c].used) {
+                        log_msg("joiner %u: round trip %.0f ms typical, %.0f ms at the 80th percentile (%u samples)",
+                            c + 1, session.clients[c].rtt_ms, session.clients[c].rtt_high_ms,
+                            session.clients[c].rtt_count);
+                    }
+                }
                 start_session();
                 for (const Client& client : session.clients) {
                     if (client.used) {
@@ -1367,12 +1517,13 @@ void publish_status() {
     status.paused = session.paused;
     status.waiting_to_start = !session.started;
     status.host_away = session.host_away;
+    status.welcomed = session.is_host || session.welcomed;
     status.loading = session.lobby_mode && session.started && (!session.loading_done ||
         (session.grace_stall && !session.paused && !session.waiting_for_host));
     if (session.is_host && !session.started) {
         bool joiners_ready = true;
         for (const Client& client : session.clients) {
-            joiners_ready &= !client.used || client.ready;
+            joiners_ready &= !client.used || (client.ready && client.rtt_ms >= 0.0f);
         }
         status.can_start = joiners_ready && session.next_free_port >= 2;
     }
@@ -1387,6 +1538,25 @@ void publish_status() {
     }
     status.am_host = session.is_host;
     status.total_ports = session.total_ports;
+    if (session.is_host && !session.started) {
+        status.router_state = static_cast<int>(sk1net_internet::port_state());
+        status.router_detail = sk1net_internet::port_detail();
+        status.public_address = session.public_address;
+        if (status.public_address.empty() && !sk1net_internet::router_address().empty()) {
+            status.public_address = sk1net_internet::router_address() + ":" + std::to_string(session.local_port);
+        }
+        status.public_lookup_done = !session.internet || session.stun_tries >= 5;
+        for (const Client& client : session.clients) {
+            if (client.used) {
+                if (!status.pings.empty()) {
+                    status.pings += ", ";
+                }
+                status.pings += client.rtt_ms < 0.0f ? std::string("...")
+                                                     : std::to_string(static_cast<int>(client.rtt_ms + 0.5f)) + " ms";
+            }
+        }
+        status.planned_delay = session.delay_from_env ? session.delay : delay_for_pings();
+    }
     for (uint32_t p = 0; p < port_count; p++) {
         sk1net::PlayerStatus& player = status.players[p];
         player.host = session.owners[p] == host_id;

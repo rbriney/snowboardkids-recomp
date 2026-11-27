@@ -44,6 +44,7 @@ namespace sk1net {
         bool paused = false; // session-wide pause (otherwise: this machine waiting for the host)
         bool waiting_to_start = false; // before the first tick: host waiting for players, or joiner connecting
         bool host_away = false;        // joiner: the host has switched to another app
+        bool welcomed = false;         // joiner: the host has answered
         bool loading = false;          // started from the lobby: waiting for every device to finish loading the game
         bool can_start = false;        // host, before the start: enough players have joined and all have the save
         uint32_t players_joined = 0;   // host, before the start
@@ -51,6 +52,13 @@ namespace sk1net {
         bool am_host = false;
         bool can_continue_without = false; // a player is disconnected; the host may drop them
         uint32_t total_ports = 0;
+        // Host, before the start: internet play.
+        std::string public_address;  // "a.b.c.d:port" from STUN or the router, or "" while unknown
+        bool public_lookup_done = false; // STUN gave up (public_address may still come from the router)
+        int router_state = 0;        // sk1net_internet::PortState
+        std::string router_detail;   // why the router could not open the port
+        std::string pings;           // e.g. "23 ms, 41 ms" (one per joining device)
+        uint32_t planned_delay = 0;  // input delay the ping calls for, in ticks
         PlayerStatus players[4];
     };
     OverlayStatus overlay_status();

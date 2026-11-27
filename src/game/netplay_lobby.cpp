@@ -33,6 +33,7 @@
 #include "netplay.h"
 #include "netplay_lobby.h"
 #include "netplay_overlay.h"
+#include "netplay_internet.h"
 
 namespace {
 
@@ -325,7 +326,8 @@ void create_lobby() {
         lobby.host_buttons[i]->set_display(Display::None);
         lobby.host_buttons[i]->add_pressed_callback([i]() { join_game(lobby.listed_addresses[i]); });
     }
-    lobby.context.create_element<Label>(lobby.join_page, "Or type the host's address", LabelStyle::Large);
+    lobby.context.create_element<Label>(lobby.join_page, "Or type the host's address (local or internet)",
+        LabelStyle::Large);
     Element* address_row = make_row(lobby.join_page);
     lobby.address_input = lobby.context.create_element<TextInput>(address_row);
     lobby.address_input->set_width(500, Unit::Dp);
@@ -353,7 +355,7 @@ void create_lobby() {
     lobby.waiting_title = lobby.context.create_element<Label>(lobby.waiting_page, "", LabelStyle::Large);
     lobby.waiting_players = lobby.context.create_element<Label>(lobby.waiting_page, "", LabelStyle::Normal);
     lobby.waiting_info = lobby.context.create_element<Label>(lobby.waiting_page, "", LabelStyle::Normal);
-    lobby.waiting_info->set_white_space(WhiteSpace::Normal);
+    lobby.waiting_info->set_white_space(WhiteSpace::Preline);
     Element* waiting_actions = make_row(lobby.waiting_page);
     lobby.waiting_start = lobby.context.create_element<Button>(waiting_actions, "Start game", ButtonStyle::Primary);
     lobby.waiting_start->add_pressed_callback([]() { sk1net::lobby_request_start(); });
@@ -436,28 +438,65 @@ void update_waiting_room() {
         return;
     }
     const sk1net::OverlayStatus status = sk1net::overlay_status();
+    // The role comes from the page the player started from: the status may not be filled in yet.
+    const bool hosting = lobby.return_page == Page::Host;
     std::string players;
     std::string info;
-    if (status.am_host) {
+    if (hosting) {
         players = "Players joined: " + std::to_string(status.players_joined) +
             (status.players_joined >= 4 ? " (full)" : "");
-        info = "Others can find this game in Netplay > Join a game, or type " + status.address + ". ";
+        if (!status.pings.empty()) {
+            players += "   (ping " + status.pings + ")";
+        }
+        info = "On this network: Netplay > Join a game finds it, or type " + status.address + ".\n";
+        const std::string port = status.address.substr(status.address.rfind(':') + 1);
+        const std::string local_ip = status.address.substr(0, status.address.rfind(':'));
+        using sk1net_internet::PortState;
+        const PortState router = static_cast<PortState>(status.router_state);
+        info += "Over the internet: ";
+        if (status.public_address.empty()) {
+            info += status.public_lookup_done ? "your internet address could not be found. "
+                                              : "finding your internet address... ";
+        } else {
+            info += "friends type " + status.public_address + ". ";
+        }
+        if (router == PortState::Working) {
+            info += "Opening the port on your router...";
+        } else if (router == PortState::Open) {
+            info += "Your router accepted the port forwarding. If friends cannot connect, some routers ignore "
+                    "automatic forwarding: add a rule for UDP port " + port + " to " + local_ip + " in its settings.";
+        } else if (router == PortState::Failed) {
+            info += "Your router could not open the port automatically (" + status.router_detail +
+                "); forward UDP port " + port + " to " + local_ip + " in your router's settings.";
+        }
+        info += "\n";
         info += status.can_start ? "Start the game when everyone you want is in."
               : status.players_joined >= 2 ? "Sending the save to the new player..."
                                            : "Waiting for someone to join...";
+        if (status.players_joined >= 2 && status.planned_delay != 0) {
+            info += " Input delay: " + std::to_string(status.planned_delay * 1000 / 30) + " ms" +
+                (status.planned_delay > 3 ? " (to suit the slowest connection)." : ".");
+        }
     } else {
-        players = "Connected to " + status.address;
-        info = "Waiting for the host to start the game.";
+        if (status.welcomed) {
+            players = "Connected to " + status.address;
+            info = "Waiting for the host to start the game.";
+        } else {
+            players = "Connecting to " + status.address + "...";
+            info = "If this takes more than a few seconds, check the address. Over the internet, the host's router "
+                   "must forward the game's port (UDP " + status.address.substr(status.address.rfind(':') + 1) +
+                   ") to the host's device.";
+        }
     }
-    const int can_start = status.am_host && status.can_start ? 1 : 0;
+    const int can_start = hosting && status.can_start ? 1 : 0;
     if (players == lobby.shown_players && info == lobby.shown_info && can_start == lobby.shown_can_start) {
         return;
     }
     lobby.context.open();
     if (lobby.shown_can_start < 0) {
-        lobby.waiting_title->set_text(status.am_host ? "Hosting a game" : "Joining a game");
-        lobby.waiting_cancel->set_text(status.am_host ? "Cancel" : "Leave");
-        lobby.waiting_start->set_display(status.am_host ? Display::Flex : Display::None);
+        lobby.waiting_title->set_text(hosting ? "Hosting a game" : "Joining a game");
+        lobby.waiting_cancel->set_text(hosting ? "Cancel" : "Leave");
+        lobby.waiting_start->set_display(hosting ? Display::Flex : Display::None);
     }
     lobby.waiting_players->set_text(players);
     lobby.waiting_info->set_text(info);
