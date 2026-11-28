@@ -1769,7 +1769,18 @@ extern "C" void recomp_get_netplay_view_port(uint8_t* rdram, recomp_context* ctx
 // s32 recomp_get_netplay_player_count(void): the number of players in a running netplay session, or 0 without one.
 // The race setup menu fixes its player count to it (patches/netplay_player_count.c).
 // Replays of netplay recordings get the recorded session's count, so they take the same path through the menus.
+// SK1_NET_RECORDED_PLAYERS=1 (unattended tests only) uses the recording's count instead, so a session with more
+// devices than the recording had players replays the recorded race exactly, the extra devices just following along.
+static bool lock_to_recorded_players() {
+    static const bool enabled = env_uint("SK1_NET_RECORDED_PLAYERS", 0, 1, 0) != 0;
+    return enabled && session.scripted && sk1det::replay_player_count() > 0;
+}
+
 extern "C" void recomp_get_netplay_player_count(uint8_t* rdram, recomp_context* ctx) {
+    if (lock_to_recorded_players() && sk1net::running_player_count() != 0) {
+        _return<s32>(ctx, sk1det::replay_player_count());
+        return;
+    }
     const int running = sk1net::running_player_count();
     _return<s32>(ctx, running != 0 ? running : sk1det::replay_player_count());
 }
@@ -1902,7 +1913,13 @@ void sk1net::pre_tick(uint8_t* rdram, gpr inputs, bool music_active) {
         const uint32_t port = session.first_port + i;
         WireInput mine{};
         if (session.scripted) {
-            sk1det::recorded_input(scheduled, port, mine.buttons, mine.stick_x, mine.stick_y);
+            // A session with more players than the recording: the extra players repeat the recorded ones (player 3
+            // plays player 1's inputs, and so on), so everyone gets through the menus and races.
+            const int recorded_players = sk1det::replay_player_count();
+            const uint32_t source = recorded_players > 0 && !lock_to_recorded_players()
+                ? port % static_cast<uint32_t>(recorded_players)
+                : port;
+            sk1det::recorded_input(scheduled, source, mine.buttons, mine.stick_x, mine.stick_y);
         } else {
             const gpr addr = inputs + i * 6;
             mine.buttons = MEM_HU(0, addr);
