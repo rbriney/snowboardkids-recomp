@@ -24,6 +24,69 @@ struct Overlay {
     recompui::Label* footer = nullptr;
 } overlay;
 
+// A banner along the top of the screen for messages (sk1net::current_notice): it does not take input or cover the
+// game, and disappears by itself.
+struct Banner {
+    bool created = false;
+    bool shown = false;
+    recompui::ContextId context;
+    recompui::Label* text = nullptr;
+    std::string current;
+} banner;
+
+void create_banner() {
+    using namespace recompui;
+    banner.context = create_context();
+    banner.context.set_captures_input(false);
+    banner.context.set_captures_mouse(false);
+    banner.context.open();
+    Element* root = banner.context.get_root_element();
+
+    Element* strip = banner.context.create_element<Element>(root);
+    strip->set_position(Position::Absolute);
+    strip->set_top(24, Unit::Dp);
+    strip->set_left(0);
+    strip->set_right(0);
+    strip->set_display(Display::Flex);
+    strip->set_justify_content(JustifyContent::Center);
+
+    Element* box = banner.context.create_element<Element>(strip);
+    box->set_padding(18.0f);
+    box->set_border_radius(16.0f);
+    box->set_background_color(Color{ 20, 24, 40, 215 });
+    box->set_max_width(1100, Unit::Dp);
+
+    banner.text = banner.context.create_element<Label>(box, "", LabelStyle::Normal);
+    banner.text->set_white_space(WhiteSpace::Normal);
+    banner.context.close();
+    banner.created = true;
+}
+
+void update_banner() {
+    const std::string notice = sk1net::current_notice();
+    if (notice.empty()) {
+        if (banner.shown) {
+            recompui::hide_context(banner.context);
+            banner.shown = false;
+            banner.current.clear();
+        }
+        return;
+    }
+    if (!banner.created) {
+        create_banner();
+    }
+    if (notice != banner.current) {
+        banner.context.open();
+        banner.text->set_text(notice);
+        banner.context.close();
+        banner.current = notice;
+    }
+    if (!banner.shown) {
+        recompui::show_context(banner.context, "");
+        banner.shown = true;
+    }
+}
+
 void create_overlay() {
     using namespace recompui;
     overlay.context = create_context();
@@ -95,6 +158,7 @@ std::string player_line(const sk1net::OverlayStatus& status, uint32_t port) {
 
 void frame_hook() {
     sk1net_lobby::frame_update();
+    update_banner();
     const sk1net::OverlayStatus status = sk1net::overlay_status();
     if (!status.visible) {
         if (overlay.shown) {

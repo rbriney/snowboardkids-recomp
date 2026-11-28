@@ -42,6 +42,7 @@ recomp_det_sync_render = 0x8F000124;
 recomp_det_ticks_per_update = 0x8F000128;
 recomp_get_netplay_view_port = 0x8F00012C;
 recomp_get_netplay_player_count = 0x8F000130;
+recomp_netplay_music_wait = 0x8F000134;
 sqrtf_recomp = 0x8F0000B8;
 
 /* librecomp / ultramodern reimplementations. Only libultra functions that are

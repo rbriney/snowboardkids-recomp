@@ -8,6 +8,9 @@
 // Determinism harness (src/game/determinism_harness.cpp). Active when SK1_DET_RECORD or SK1_DET_REPLAY is set.
 namespace sk1det {
     bool active();
+    // While replaying a netplay recording, the number of players in that session (0 otherwise), so the menus that
+    // netplay locks to the session's player count behave the same in the replay.
+    int replay_player_count();
     // Redirect game saves to the harness's in-memory copy while it is active. Return false when inactive.
     bool save_read(uint8_t* rdram, gpr dst, uint32_t offset, uint32_t size);
     bool save_write(uint8_t* rdram, gpr src, uint32_t offset, uint32_t size);

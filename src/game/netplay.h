@@ -62,6 +62,9 @@ namespace sk1net {
         PlayerStatus players[4];
     };
     OverlayStatus overlay_status();
+    // A message for the player (the session ended, the games went out of sync...), for a few seconds after it
+    // happened; "" otherwise. Shown as a banner over the game.
+    std::string current_notice();
 
     // This device's address on the local network (the one other devices would use to reach it), or "" if unknown.
     std::string local_address();
@@ -91,14 +94,20 @@ namespace sk1net {
     std::string finish_lobby_session();
 
     bool active();
+    // The number of players in a running session, or 0 without one.
+    int running_player_count();
     // Which local controller should rumble for a game port: the port itself without netplay; during netplay the
     // local player index if that port's player is on this device, otherwise -1 (someone else's rumble).
     int local_player_for_port(int port);
     // Called at the start of each game tick with the game's ControllerInputState[4] array. Blocks until every
     // player's input for this tick has arrived, then writes all four ports.
-    void pre_tick(uint8_t* rdram, gpr inputs);
-    // Called after the tick's game logic with a hash of the game state, for desync detection.
-    void post_tick(uint32_t state_hash);
+    // music_active: whether this device's music is playing; the host sends its own with its inputs.
+    void pre_tick(uint8_t* rdram, gpr inputs, bool music_active);
+    // Whether the host's music was playing, as sent with the host's input for the current tick.
+    bool host_music_active();
+    // Called after the tick's game logic with a hash of the game state, for desync detection, and the words it was
+    // made from (kept for recent ticks and written to a file if the devices disagree).
+    void post_tick(uint32_t state_hash, const uint32_t* state_words = nullptr, size_t word_count = 0);
     // Redirect game saves to the session's in-memory save. Return false when netplay is inactive.
     bool save_read(uint8_t* rdram, gpr dst, uint32_t offset, uint32_t size);
     bool save_write(uint8_t* rdram, gpr src, uint32_t offset, uint32_t size);

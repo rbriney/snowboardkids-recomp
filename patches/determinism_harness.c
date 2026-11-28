@@ -1,5 +1,6 @@
 #include "patches.h"
 
+#include "game/audio/audio_engine.h"
 #include "game/audio/sound_manager.h"
 #include "game/engine/controller_input.h"
 #include "game/engine/frame_render_task.h"
@@ -12,7 +13,8 @@
 // Each game tick, recomp_det_pre_tick records the four ports' inputs or replaces them with recorded ones, and
 // recomp_det_post_tick hashes game state after the tick. Both are no-ops unless SK1_DET_RECORD or SK1_DET_REPLAY
 // is set.
-extern void recomp_det_pre_tick(ControllerInputState* inputs, u8* connectedMask);
+// musicActive: whether this device's music is playing (netplay sends the host's, patches/netplay_music_wait.c).
+extern void recomp_det_pre_tick(ControllerInputState* inputs, u8* connectedMask, s32 musicActive);
 extern void recomp_det_post_tick(RacePlayer* players, u16* mainRngIndex, u16* secondaryRngIndex, s16* frameCounter);
 extern s32 recomp_det_sync_render(void);
 extern s32 recomp_det_ticks_per_update(void);
@@ -71,7 +73,7 @@ static void runGameTick(void) {
     }
 
     // @recomp Record or inject this tick's controller inputs.
-    recomp_det_pre_tick(gControllerInputState, &gConnectedControllerBitmask);
+    recomp_det_pre_tick(gControllerInputState, &gConnectedControllerBitmask, MusAsk(2));
 
     gFrameCounter = (gFrameCounter + 1) & 0xFFF;
     resetRenderScratchAllocator();

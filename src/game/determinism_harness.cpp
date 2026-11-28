@@ -61,7 +61,9 @@ struct PortInput {
 struct TickRecord {
     uint32_t tick;
     uint8_t connected_mask;
-    uint8_t padding[3];
+    uint8_t player_count; // players in the netplay session (0: not recorded; older recordings)
+    uint8_t host_music;   // the host's music state this tick: 0 not recorded, 1 silent, 2 playing
+    uint8_t padding;
     PortInput inputs[port_count];
     uint32_t named[named_count];
     uint32_t blocks[block_count];
@@ -245,12 +247,15 @@ uint32_t hash_words(uint8_t* rdram, gpr vaddr, uint32_t size) {
 
 // A racer's state for netplay desync checks: the whole RacePlayer except its pointers into per-frame render scratch
 // memory: the shadow's vertex and matrix buffers (RacePlayerState+0x47C/0x480) and the 14 model-part matrices
-// (RacePlayerState+0x514..0x54B). Their addresses depend on how much is drawn each frame (for example with own view
-// hiding other players' viewports) and never affect gameplay.
+// (RacePlayerState+0x514..0x54B), and the speed fan item's two matrices (RacePlayerState+0x5DC/0x5E0). Their
+// addresses depend on how much is drawn each frame (for example with own view hiding other players' viewports) and
+// never affect gameplay.
 bool is_render_scratch_pointer(uint32_t racer_offset) {
     constexpr uint32_t state = 0x1C;
+    constexpr uint32_t speed_fan = state + 0x570; // SpeedFanState: frontMatrix (+0x6C) and backMatrix (+0x70)
     return racer_offset == state + 0x47C || racer_offset == state + 0x480 ||
-        (racer_offset >= state + 0x514 && racer_offset < state + 0x54C);
+        (racer_offset >= state + 0x514 && racer_offset < state + 0x54C) || racer_offset == speed_fan + 0x6C ||
+        racer_offset == speed_fan + 0x70;
 }
 
 uint32_t hash_racer_for_netplay(uint8_t* rdram, gpr vaddr) {
@@ -372,6 +377,32 @@ bool sk1det::active() {
     return state.mode != Mode::Off;
 }
 
+int sk1det::replay_player_count() {
+    init();
+    if (state.mode != Mode::Replay || state.replay.empty()) {
+        return 0;
+    }
+    const TickRecord& now = state.replay[std::min<size_t>(state.tick, state.replay.size() - 1)];
+    if (now.player_count != 0) {
+        return now.player_count;
+    }
+    // Older netplay recordings did not store it: count the ports up to the last one that ever pressed anything.
+    static int inferred = -1;
+    if (inferred < 0) {
+        inferred = 0;
+        for (const TickRecord& rec : state.replay) {
+            for (int port = port_count - 1; port >= inferred; port--) {
+                if (rec.inputs[port].buttons != 0 || rec.inputs[port].stick_x != 0 || rec.inputs[port].stick_y != 0) {
+                    inferred = port + 1;
+                    break;
+                }
+            }
+        }
+        log_line("recording has no player count; inferred %s from its inputs", std::to_string(inferred));
+    }
+    return inferred >= 2 ? inferred : 0;
+}
+
 bool sk1det::save_read(uint8_t* rdram, gpr dst, uint32_t offset, uint32_t size) {
     if (!active()) {
         return false;
@@ -403,6 +434,23 @@ extern "C" void recomp_det_sync_render(uint8_t* rdram, recomp_context* ctx) {
     _return<s32>(ctx, (sk1det::active() || sk1net::active()) ? 1 : 0);
 }
 
+// s32 recomp_netplay_music_wait(s32 localActive), for patches/netplay_music_wait.c: whether the race results should
+// treat music as still playing. Outside netplay that is this device's own answer. In a netplay session it is the
+// host's (sent with its inputs, so the same on every device for every tick); a replay of a netplay recording uses the
+// recorded host answer.
+extern "C" void recomp_netplay_music_wait(uint8_t* rdram, recomp_context* ctx) {
+    const int32_t local_active = static_cast<int32_t>(ctx->r4);
+    if (sk1net::running_player_count() != 0) {
+        _return<s32>(ctx, sk1net::host_music_active() ? 1 : 0);
+        return;
+    }
+    if (state.mode == Mode::Replay && state.tick < state.replay.size() && state.replay[state.tick].host_music != 0) {
+        _return<s32>(ctx, state.replay[state.tick].host_music == 2 ? 1 : 0);
+        return;
+    }
+    _return<s32>(ctx, local_active);
+}
+
 // s32 recomp_det_ticks_per_update(void): game ticks per scheduler update. 1 normally; SK1_DET_SPEED=<n> (1-8)
 // fast-forwards a replay that is not part of a netplay session.
 extern "C" void recomp_det_ticks_per_update(uint8_t* rdram, recomp_context* ctx) {
@@ -418,7 +466,7 @@ extern "C" void recomp_det_ticks_per_update(uint8_t* rdram, recomp_context* ctx)
 extern "C" void recomp_det_pre_tick(uint8_t* rdram, recomp_context* ctx) {
     sk1perf::tick_render_wait_done();
     // Netplay supplies the inputs first, so a netplay session can also be recorded by the harness.
-    sk1net::pre_tick(rdram, ctx->r4);
+    sk1net::pre_tick(rdram, ctx->r4, static_cast<int32_t>(ctx->r6) != 0);
     if (!sk1det::active()) {
         return;
     }
@@ -452,6 +500,10 @@ extern "C" void recomp_det_pre_tick(uint8_t* rdram, recomp_context* ctx) {
     }
 
     rec.connected_mask = MEM_BU(0, mask);
+    rec.player_count = static_cast<uint8_t>(sk1net::running_player_count());
+    if (rec.player_count != 0) {
+        rec.host_music = sk1net::host_music_active() ? 2 : 1;
+    }
     for (uint32_t port = 0; port < port_count; port++) {
         gpr addr = inputs + port * 6;
         rec.inputs[port].buttons = MEM_HU(0, addr);
@@ -484,7 +536,16 @@ extern "C" void recomp_det_post_tick(uint8_t* rdram, recomp_context* ctx) {
             combined = (combined ^ hash_racer_for_netplay(rdram, players + i * racer_size)) * 0x01000193u;
         }
         combined = (combined ^ named[rng_named_index]) * 0x01000193u;
-        sk1net::post_tick(combined);
+        // The hashed words, for the desync report: each racer (render scratch pointers zeroed), then the RNG word.
+        static uint32_t words[racer_count * racer_size / 4 + 1];
+        for (uint32_t i = 0; i < racer_count; i++) {
+            for (uint32_t offset = 0; offset < racer_size; offset += 4) {
+                words[(i * racer_size + offset) / 4] =
+                    is_render_scratch_pointer(offset) ? 0 : static_cast<uint32_t>(MEM_W(offset, players + i * racer_size));
+            }
+        }
+        words[racer_count * racer_size / 4] = named[rng_named_index];
+        sk1net::post_tick(combined, words, std::size(words));
     }
     if (!harness) {
         return;

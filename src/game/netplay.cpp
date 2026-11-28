@@ -93,7 +93,7 @@ constexpr socket_t invalid_socket = -1;
 using clock_type = std::chrono::steady_clock;
 
 constexpr uint32_t packet_magic = 0x4E314B53; // "SK1N"
-constexpr uint16_t protocol_version = 7; // 7: internet play (Ping/Pong, adaptive input delay)
+constexpr uint16_t protocol_version = 8; // 7: internet play (Ping/Pong, adaptive input delay); 8: host music flag
 constexpr uint32_t save_size = 0x8000;
 constexpr uint32_t chunk_size = 1024;
 constexpr uint32_t chunk_count = save_size / chunk_size;
@@ -187,6 +187,10 @@ struct PingPacket {
     Header header;
     uint32_t millis; // the host's clock when sent, echoed back unchanged
 };
+// An N64 button bit the controller never sets: on the host's first port it carries whether the host's music is
+// playing (for the race results, patches/netplay_music_wait.c). It is removed before the game sees the input.
+constexpr uint16_t host_music_bit = 0x0080;
+
 struct WireInput {
     uint16_t buttons;
     int8_t stick_x;
@@ -304,6 +308,7 @@ struct Session {
 
     std::array<PortStream, port_count> ports{};
     uint32_t tick = 0;
+    bool host_music = false; // the host's music state for the current tick
 
     std::array<uint32_t, hash_history> my_hash_tick{};
     std::array<uint32_t, hash_history> my_hash{};
@@ -311,6 +316,10 @@ struct Session {
     std::array<std::array<uint32_t, hash_history>, max_clients + 1> peer_hash{};
     uint32_t last_hash_tick = no_tick;
     bool desync_reported = false;
+    // The words each recent tick's hash was made from (state_snapshot_ticks of them), so a desync can be diagnosed.
+    std::vector<uint32_t> snapshot_words;
+    std::array<uint32_t, 128> snapshot_tick{};
+    size_t snapshot_size = 0;
 
     FILE* log = nullptr;
 
@@ -373,6 +382,13 @@ void log_msg(const char* fmt, ...) {
 
 // Player-facing notice: a message box on its own thread so the game never waits on it. Suppressed for scripted
 // (unattended) runs, where nobody could dismiss it.
+// The latest message for the player, shown for a few seconds as a banner over the game (src/game/netplay_overlay.cpp)
+// rather than a dialog that interrupts it. Kept outside the session, which may be reset before it is shown.
+std::mutex notice_mutex;
+std::string notice_text;
+clock_type::time_point notice_time;
+constexpr auto notice_duration = std::chrono::seconds(8);
+
 void notify_player(const std::string& message) {
     if (session.scripted) {
         return;
@@ -381,9 +397,9 @@ void notify_player(const std::string& message) {
         session.end_reason = message;
         return;
     }
-    std::thread([message] {
-        SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_WARNING, "Snowboard Kids netplay", message.c_str(), nullptr);
-    }).detach();
+    std::lock_guard lock{ notice_mutex };
+    notice_text = message;
+    notice_time = clock_type::now();
 }
 
 std::string address_text(const sockaddr_in& a) {
@@ -539,14 +555,39 @@ void send_inputs() {
     }
 }
 
+std::filesystem::path log_folder();
+
+// Writes the words tick t's hash was made from, one per line with its offset, so the files from two devices can be
+// compared to find what differs.
+void write_desync_dump(uint32_t t) {
+    const size_t slot = t % session.snapshot_tick.size();
+    if (session.snapshot_size == 0 || session.snapshot_tick[slot] != t) {
+        log_msg("no game state kept for tick %u", t);
+        return;
+    }
+    const char* instance = std::getenv("SK1_NET_INSTANCE");
+    const std::string name = std::string(session.is_host ? "netplay-desync-host" : "netplay-desync-join") +
+        (instance != nullptr && instance[0] != 0 ? std::string("-") + instance : std::string()) + ".txt";
+    std::ofstream out(log_folder() / name, std::ios::trunc);
+    out << "tick " << t << '\n';
+    const uint32_t* words = session.snapshot_words.data() + slot * session.snapshot_size;
+    char line[48];
+    for (size_t i = 0; i < session.snapshot_size; i++) {
+        std::snprintf(line, sizeof(line), "%04zx %08x\n", i * 4, words[i]);
+        out << line;
+    }
+    log_msg("wrote the game state of tick %u to %s", t, name.c_str());
+}
+
 void report_desync(uint32_t t, uint8_t peer) {
     if (session.desync_reported) {
         return;
     }
     session.desync_reported = true;
     log_msg("DESYNC: game state differs from %s at tick %u", peer == host_id ? "the host's" : "a joiner's", t);
-    notify_player("The games have gone out of sync, so they may no longer show the same race. "
-                  "Restart the games to play again.");
+    write_desync_dump(t);
+    notify_player("Netplay: the games have gone out of sync, so they may no longer show the same race. "
+                  "Restart the games to play together again.");
 }
 
 void check_hash(uint32_t t, uint8_t peer) {
@@ -1042,12 +1083,15 @@ bool set_non_blocking(socket_t s) {
 #endif
 }
 
-void open_log(const std::string& name) {
-    std::filesystem::path folder = std::filesystem::current_path();
+std::filesystem::path log_folder() {
     if (const char* app = std::getenv("APP_FOLDER_PATH"); app != nullptr && *app != '\0') {
-        folder = std::filesystem::u8path(app);
+        return std::filesystem::u8path(app);
     }
-    session.log = std::fopen((folder / name).string().c_str(), "w");
+    return std::filesystem::current_path();
+}
+
+void open_log(const std::string& name) {
+    session.log = std::fopen((log_folder() / name).string().c_str(), "w");
 }
 
 uint32_t env_uint(const char* name, uint32_t min_value, uint32_t max_value, uint32_t fallback) {
@@ -1724,9 +1768,23 @@ extern "C" void recomp_get_netplay_view_port(uint8_t* rdram, recomp_context* ctx
 
 // s32 recomp_get_netplay_player_count(void): the number of players in a running netplay session, or 0 without one.
 // The race setup menu fixes its player count to it (patches/netplay_player_count.c).
+// Replays of netplay recordings get the recorded session's count, so they take the same path through the menus.
 extern "C" void recomp_get_netplay_player_count(uint8_t* rdram, recomp_context* ctx) {
+    const int running = sk1net::running_player_count();
+    _return<s32>(ctx, running != 0 ? running : sk1det::replay_player_count());
+}
+
+int sk1net::running_player_count() {
     const bool running = session.enabled && session.started && !session.ended;
-    _return<s32>(ctx, running ? static_cast<s32>(session.total_ports) : 0);
+    return running ? static_cast<int>(session.total_ports) : 0;
+}
+
+std::string sk1net::current_notice() {
+    std::lock_guard lock{ notice_mutex };
+    if (notice_text.empty() || clock_type::now() - notice_time > notice_duration) {
+        return {};
+    }
+    return notice_text;
 }
 
 sk1net::OverlayStatus sk1net::overlay_status() {
@@ -1814,7 +1872,7 @@ bool sk1net::active() {
     return session.enabled && !session.ended;
 }
 
-void sk1net::pre_tick(uint8_t* rdram, gpr inputs) {
+void sk1net::pre_tick(uint8_t* rdram, gpr inputs, bool music_active) {
     if (!active()) {
         return;
     }
@@ -1850,6 +1908,10 @@ void sk1net::pre_tick(uint8_t* rdram, gpr inputs) {
             mine.buttons = MEM_HU(0, addr);
             mine.stick_x = MEM_B(2, addr);
             mine.stick_y = MEM_B(3, addr);
+        }
+        mine.buttons &= ~host_music_bit;
+        if (session.is_host && i == 0 && music_active) {
+            mine.buttons |= host_music_bit;
         }
         session.ports[port].set(scheduled, mine);
     }
@@ -1926,6 +1988,10 @@ void sk1net::pre_tick(uint8_t* rdram, gpr inputs) {
             // Unused ports: neutral, or (in a scripted test) the recording's inputs, identical on every machine.
             sk1det::recorded_input(session.tick, port, in.buttons, in.stick_x, in.stick_y);
         }
+        if (port == 0) {
+            session.host_music = (in.buttons & host_music_bit) != 0; // the host always has port 1
+        }
+        in.buttons &= ~host_music_bit;
         const gpr addr = inputs + port * 6;
         MEM_H(0, addr) = in.buttons;
         MEM_B(2, addr) = in.stick_x;
@@ -1933,9 +1999,23 @@ void sk1net::pre_tick(uint8_t* rdram, gpr inputs) {
     }
 }
 
-void sk1net::post_tick(uint32_t state_hash) {
+bool sk1net::host_music_active() {
+    return session.host_music;
+}
+
+void sk1net::post_tick(uint32_t state_hash, const uint32_t* state_words, size_t word_count) {
     if (!active() || !session.started) {
         return;
+    }
+    if (word_count != 0) {
+        if (session.snapshot_size != word_count) {
+            session.snapshot_size = word_count;
+            session.snapshot_words.assign(word_count * session.snapshot_tick.size(), 0);
+            session.snapshot_tick.fill(no_tick);
+        }
+        const size_t snap = session.tick % session.snapshot_tick.size();
+        session.snapshot_tick[snap] = session.tick;
+        std::memcpy(session.snapshot_words.data() + snap * word_count, state_words, word_count * sizeof(uint32_t));
     }
     const uint32_t slot = session.tick % hash_history;
     session.my_hash_tick[slot] = session.tick;
