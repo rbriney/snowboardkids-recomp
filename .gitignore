@@ -82,3 +82,6 @@ patches/patches.map
 
 # Determinism harness recordings and RDRAM snapshots
 det/
+
+# Logs from the port scripts in tools/
+tools/*.log
